@@ -1,14 +1,14 @@
+use anyhow::{Context, Result, bail};
+use arc_swap::ArcSwap;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    fs,
     net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
-
-use anyhow::{Context, Result, bail};
-use arc_swap::ArcSwap;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::{
     signal::unix::{SignalKind, signal},
     sync::{RwLock, mpsc},
@@ -51,6 +51,7 @@ pub async fn run(config_path: PathBuf, config_dir: PathBuf, ctl_path: PathBuf) -
 
     let dns = Arc::new(DnsService::new(
         loaded.zone.clone(),
+        loaded.reverse_zones.clone(),
         &*store.read().await,
         loaded.raw.negative_ttl,
     )?);
@@ -182,26 +183,47 @@ fn build_watcher(
     config_dir: &Path,
     secret_file: Option<&Path>,
 ) -> Result<RecommendedWatcher> {
+    fs::create_dir_all(config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
+    let config_path = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    let config_dir = config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf());
+    let secret_file =
+        secret_file.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+
+    let mut paths = HashSet::new();
+    if let Some(parent) = config_path.parent() {
+        paths.insert(parent.to_path_buf());
+    }
+    paths.insert(config_dir.clone());
+    if let Some(parent) = secret_file.as_deref().and_then(Path::parent) {
+        paths.insert(parent.to_path_buf());
+    }
+
+    let filter_config = config_path.clone();
+    let filter_dir = config_dir.clone();
+    let filter_secret = secret_file.clone();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-        if result.is_ok() {
+        let Ok(event) = result else {
+            return;
+        };
+        let relevant = event.paths.iter().any(|path| {
+            path == &filter_config
+                || path.starts_with(&filter_dir)
+                || filter_secret.as_ref().is_some_and(|secret| path == secret)
+        });
+        if relevant {
             let _ = tx.send(());
         }
     })
     .context("creating config watcher")?;
-    watcher
-        .watch(config_path, RecursiveMode::NonRecursive)
-        .with_context(|| format!("watching {}", config_path.display()))?;
-    if config_dir.exists() {
+
+    for path in paths {
         watcher
-            .watch(config_dir, RecursiveMode::NonRecursive)
-            .with_context(|| format!("watching {}", config_dir.display()))?;
-    }
-    if let Some(secret_file) = secret_file
-        && secret_file.exists()
-    {
-        watcher
-            .watch(secret_file, RecursiveMode::NonRecursive)
-            .with_context(|| format!("watching {}", secret_file.display()))?;
+            .watch(&path, RecursiveMode::NonRecursive)
+            .with_context(|| format!("watching {}", path.display()))?;
     }
     Ok(watcher)
 }
@@ -230,6 +252,9 @@ async fn reload(
         && id != old.node_id()
     {
         bail!("changing id requires a restart");
+    }
+    if new.reverse_zones != old.reverse_zones {
+        warn!("changing reverse_zones requires a restart");
     }
     let secret_changed = new.secret != old.secret;
     let new_secret = new.secret.clone();

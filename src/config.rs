@@ -95,6 +95,8 @@ where
 pub struct Config {
     pub id: Option<u64>,
     pub zone: String,
+    #[serde(default)]
+    pub reverse_zones: Vec<String>,
     #[serde(default = "default_dns_listen")]
     pub dns_listen: Vec<SocketAddr>,
     #[serde(default = "default_port")]
@@ -177,6 +179,7 @@ struct Dropin {
 pub struct LoadedConfig {
     pub raw: Config,
     pub zone: Name,
+    pub reverse_zones: Vec<Name>,
     pub secret: Vec<u8>,
     pub records: Vec<ResolvedRecord>,
     pub node_id: u64,
@@ -218,6 +221,16 @@ impl LoadedConfig {
         }
 
         let zone = normalize_zone(&raw.zone)?;
+        let reverse_zones = raw
+            .reverse_zones
+            .iter()
+            .map(|zone| normalize_zone(zone))
+            .collect::<Result<Vec<_>>>()?;
+        for reverse in &reverse_zones {
+            if *reverse == zone || !is_reverse_zone(reverse) {
+                bail!("invalid reverse zone {reverse}");
+            }
+        }
         let secret = resolve_secret(&raw)?;
         let records = resolve_records(&zone, &specs)?;
         validate_records(&records)?;
@@ -225,6 +238,7 @@ impl LoadedConfig {
             node_id: raw.id.unwrap_or_else(rand::random),
             raw,
             zone,
+            reverse_zones,
             secret,
             records,
         })
@@ -267,6 +281,10 @@ pub fn normalize_zone(input: &str) -> Result<Name> {
         bail!("zone must be fully qualified");
     }
     Ok(name.to_lowercase())
+}
+fn is_reverse_zone(zone: &Name) -> bool {
+    let name = zone.to_string();
+    name.ends_with("in-addr.arpa.") || name.ends_with("ip6.arpa.")
 }
 
 pub fn normalize_name(input: &str, zone: &Name) -> Result<Name> {
@@ -476,5 +494,33 @@ value = "fd00::1"
             "zone = \"namae.\"\nsecret = \"a\"\nsecret_file = \"b\"\n",
         );
         assert!(LoadedConfig::load(&main, &dir.path().join("d")).is_err());
+    }
+
+    #[test]
+    fn reverse_zones_are_normalized_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("namae.toml");
+        write(
+            dir.path(),
+            "namae.toml",
+            "zone = \"namae.\"\nsecret = \"test\"\nreverse_zones = [\"10.in-addr.arpa.\"]\n",
+        );
+        let loaded = LoadedConfig::load(&main, &dir.path().join("d")).unwrap();
+        assert_eq!(loaded.reverse_zones[0].to_string(), "10.in-addr.arpa.");
+        write(
+            dir.path(),
+            "namae.toml",
+            "zone = \"namae.\"\nsecret = \"test\"\nreverse_zones = [\"example.com.\"]\n",
+        );
+        assert!(LoadedConfig::load(&main, &dir.path().join("d")).is_err());
+    }
+
+    #[test]
+    fn wildcard_names_are_allowed() {
+        let zone = normalize_zone("namae.").unwrap();
+        assert_eq!(
+            normalize_name("*.namae.", &zone).unwrap().to_string(),
+            "*.namae."
+        );
     }
 }

@@ -76,12 +76,14 @@ pub struct Frame {
 #[derive(Debug, Clone, Copy)]
 pub struct PeerIdentity {
     pub node_id: u64,
+    pub listen_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClientHello {
     v: u8,
     node_id: u64,
+    listen_port: u16,
     nonce: [u8; 32],
 }
 
@@ -89,6 +91,7 @@ struct ClientHello {
 struct ServerHello {
     v: u8,
     node_id: u64,
+    listen_port: u16,
     nonce: [u8; 32],
     mac: [u8; 32],
 }
@@ -299,6 +302,7 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     mut io: S,
     secret: &[u8],
     node_id: u64,
+    listen_port: u16,
 ) -> Result<(SecureStream<S>, PeerIdentity), WireError> {
     let mut nonce_c = [0u8; 32];
     rand::rng().fill_bytes(&mut nonce_c);
@@ -307,6 +311,7 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         &serde_json::to_vec(&ClientHello {
             v: VERSION,
             node_id,
+            listen_port,
             nonce: nonce_c,
         })?,
     )
@@ -323,7 +328,9 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
             &nonce_c,
             &hello.nonce,
             &node_id.to_be_bytes(),
+            &listen_port.to_be_bytes(),
             &hello.node_id.to_be_bytes(),
+            &hello.listen_port.to_be_bytes(),
         ],
     )?;
     if expected.ct_eq(&hello.mac).unwrap_u8() != 1 {
@@ -337,7 +344,9 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
             &nonce_c,
             &hello.nonce,
             &node_id.to_be_bytes(),
+            &listen_port.to_be_bytes(),
             &hello.node_id.to_be_bytes(),
+            &hello.listen_port.to_be_bytes(),
         ],
     )?;
     write_plain(&mut io, &serde_json::to_vec(&ClientAuth { mac: mac_c })?).await?;
@@ -357,6 +366,7 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         },
         PeerIdentity {
             node_id: hello.node_id,
+            listen_port: hello.listen_port,
         },
     ))
 }
@@ -365,6 +375,7 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     mut io: S,
     secret: &[u8],
     node_id: u64,
+    listen_port: u16,
 ) -> Result<(SecureStream<S>, PeerIdentity), WireError> {
     let hello: ClientHello = serde_json::from_slice(&read_plain(&mut io).await?)?;
     if hello.v != VERSION {
@@ -379,7 +390,9 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
             &hello.nonce,
             &nonce_s,
             &hello.node_id.to_be_bytes(),
+            &hello.listen_port.to_be_bytes(),
             &node_id.to_be_bytes(),
+            &listen_port.to_be_bytes(),
         ],
     )?;
     write_plain(
@@ -387,6 +400,7 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         &serde_json::to_vec(&ServerHello {
             v: VERSION,
             node_id,
+            listen_port,
             nonce: nonce_s,
             mac: mac_s,
         })?,
@@ -401,7 +415,9 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
             &hello.nonce,
             &nonce_s,
             &hello.node_id.to_be_bytes(),
+            &hello.listen_port.to_be_bytes(),
             &node_id.to_be_bytes(),
+            &listen_port.to_be_bytes(),
         ],
     )?;
     if expected.ct_eq(&auth.mac).unwrap_u8() != 1 {
@@ -423,6 +439,7 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         },
         PeerIdentity {
             node_id: hello.node_id,
+            listen_port: hello.listen_port,
         },
     ))
 }
@@ -437,15 +454,17 @@ mod tests {
         let (client, server) = duplex(8192);
         let secret = b"test-secret";
         let server_task = tokio::spawn(async move {
-            let (mut stream, peer) = server_handshake(server, secret, 2).await.unwrap();
+            let (mut stream, peer) = server_handshake(server, secret, 2, 7654).await.unwrap();
             assert_eq!(peer.node_id, 1);
+            assert_eq!(peer.listen_port, 7654);
             let frame = stream.recv().await.unwrap();
             assert_eq!(frame.kind, FrameKind::Ping);
             assert_eq!(frame.body, b"hello");
             stream.send(FrameKind::Pong, b"world").await.unwrap();
         });
-        let (mut stream, peer) = client_handshake(client, secret, 1).await.unwrap();
+        let (mut stream, peer) = client_handshake(client, secret, 1, 7654).await.unwrap();
         assert_eq!(peer.node_id, 2);
+        assert_eq!(peer.listen_port, 7654);
         stream.send(FrameKind::Ping, b"hello").await.unwrap();
         let frame = stream.recv().await.unwrap();
         assert_eq!(frame.kind, FrameKind::Pong);
@@ -457,8 +476,8 @@ mod tests {
     async fn wrong_secret_is_rejected() {
         let (client, server) = duplex(8192);
         let server_task =
-            tokio::spawn(async move { server_handshake(server, b"server-secret", 2).await });
-        let result = client_handshake(client, b"client-secret", 1).await;
+            tokio::spawn(async move { server_handshake(server, b"server-secret", 2, 7654).await });
+        let result = client_handshake(client, b"client-secret", 1, 7654).await;
         assert!(result.is_err());
         assert!(server_task.await.unwrap().is_err());
     }

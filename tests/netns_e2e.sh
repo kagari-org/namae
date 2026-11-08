@@ -76,6 +76,7 @@ write_config() {
     mkdir -p "$path.d"
     cat > "$path" <<CONFIG
 zone = "namae."
+reverse_zones = ["10.in-addr.arpa."]
 dns_listen = ["127.0.0.1:15353"]
 port = 17654
 secret = "netns-e2e"
@@ -142,6 +143,11 @@ wait_for "$N2" "b.namae." "10.0.0.2"
 wait_for "$N3" "a.namae." "10.0.0.1"
 wait_for "$N1" "b.namae." "10.0.0.2"
 
+# PTR from the A record.
+if ! ip netns exec "$N1" "$DIG" @127.0.0.1 -p 15353 +short 1.0.0.10.in-addr.arpa. PTR 2>/dev/null | grep -qx "a.namae."; then
+    fail "expected PTR for 10.0.0.1 to be a.namae."
+fi
+
 # DNS negative behavior.
 if ! ip netns exec "$N3" "$DIG" @127.0.0.1 -p 15353 +noall +comments missing.namae A 2>/dev/null | grep -q 'status: NXDOMAIN'; then
     fail "expected NXDOMAIN for missing.namae"
@@ -150,4 +156,21 @@ if ! ip netns exec "$N3" "$DIG" @127.0.0.1 -p 15353 +noall +comments example.com
     fail "expected REFUSED for example.com"
 fi
 
-echo "PASS: netns e2e (n1 <-> n2 <-> n3, two-hop gossip)"
+
+# Route flap: remove the n1 <-> n2 paths, then bring them back.
+ip -n "$N1" route del 10.200.0.2/32 proto bird
+ip -n "$N2" route del 10.200.0.1/32 proto bird
+for _ in $(seq 1 50); do
+    if "$BIN" ctl --socket "$TMP/n1.sock" peers 2>/dev/null | grep -q '"peers": \[\]'; then
+        break
+    fi
+    sleep 0.2
+done
+if ! "$BIN" ctl --socket "$TMP/n1.sock" peers 2>/dev/null | grep -q '"peers": \[\]'; then
+    fail "n1 did not drop its peer after route removal"
+fi
+ip -n "$N1" route add 10.200.0.2/32 proto bird dev veth1
+ip -n "$N2" route add 10.200.0.1/32 proto bird dev veth2
+wait_for "$N1" "b.namae." "10.0.0.2"
+
+echo "PASS: netns e2e (n1 <-> n2 <-> n3, two-hop gossip, PTR, route flap)"

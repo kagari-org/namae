@@ -1,28 +1,29 @@
 # namae gossip protocol v1
 
-gossip 是 namae 的内部同步协议。它不面向公网，也不是 DNS 协议本身。
+Gossip is `namae`'s internal synchronization protocol. It is not exposed to the public internet and is not the DNS protocol itself.
 
 ## Transport
 
-- TCP，默认端口 `7654`。
-- 握手完成后，每一帧都是长度前缀 + HMAC-SHA256。
-- 帧编码是 JSON；`namae/1` 是当前版本。
-- 单帧最大 1 MiB。
+- TCP, default port `7654`.
+- After the handshake, every frame is length-prefixed and authenticated with HMAC-SHA256.
+- Frames are encoded as JSON; `namae/1` is the current version.
+- Maximum frame size is 1 MiB.
 
 ## Handshake
 
 ```text
-C -> S: ClientHello { v, node_id_c, nonce_c[32] }
-S -> C: ServerHello { v, node_id_s, nonce_s[32],
-                      mac_s = HMAC(secret, "namae/1 server" || nonce_c || nonce_s || id_c || id_s) }
-C -> S: ClientAuth  { mac_c = HMAC(secret, "namae/1 client" || nonce_c || nonce_s || id_c || id_s) }
+C -> S: ClientHello { v, node_id_c, listen_port_c, nonce_c[32] }
+S -> C: ServerHello { v, node_id_s, listen_port_s, nonce_s[32],
+                      mac_s = HMAC(secret, "namae/1 server" || nonce_c || nonce_s || id_c || port_c || id_s || port_s) }
+C -> S: ClientAuth  { mac_c = HMAC(secret, "namae/1 client" || nonce_c || nonce_s || id_c || port_c || id_s || port_s) }
 ```
 
-- 双方验证 MAC 后，用 HKDF-SHA256 派生每方向密钥：
+- After both sides verify the MAC, HKDF-SHA256 derives one key per direction:
   - `k_c2s = HKDF(secret, salt = nonce_c || nonce_s, info = "namae/1 c2s")`
   - `k_s2c = HKDF(secret, salt = nonce_c || nonce_s, info = "namae/1 s2c")`
-- 握手 5 秒超时；握手帧最大 4 KiB。
-- 错误 secret、MAC 错误、重放都会关闭连接。
+- Handshake timeout is 5 seconds; handshake frames are limited to 4 KiB.
+- `listen_port` lets the receiver turn an inbound TCP connection's ephemeral source port into the peer's gossip listen address.
+- A wrong secret, a bad MAC, or a replay closes the connection.
 
 ## Frame
 
@@ -30,9 +31,9 @@ C -> S: ClientAuth  { mac_c = HMAC(secret, "namae/1 client" || nonce_c || nonce_
 magic "NM" | v u8 | kind u8 | seq u64 | len u32 | body | mac[32]
 ```
 
-- `mac = HMAC(k_dir, header || body)`。
-- `seq` 每方向严格递增；接收端拒绝 `seq <= last_seq`。
-- `kind`：
+- `mac = HMAC(k_dir, header || body)`.
+- `seq` strictly increases in each direction; the receiver rejects `seq <= last_seq`.
+- `kind`:
   - 1 `Snapshot`
   - 2 `Delta`
   - 3 `Heartbeat`
@@ -69,9 +70,9 @@ magic "NM" | v u8 | kind u8 | seq u64 | len u32 | body | mac[32]
 }
 ```
 
-- `total > 1` 时按 `(origin, session, seq)` 组装；每 chunk 最多 128 条。
-- 接收方用完整 snapshot 替换该 origin 的当前状态。
-- 应用成功且内容变化后，会继续转发给其他 peer。
+- When `total > 1`, chunks are assembled by `(origin, session, seq)`; each chunk holds at most 128 entries.
+- A complete snapshot replaces the current state for that origin.
+- After a successful apply that changes state, the snapshot is forwarded to other peers.
 
 ### Delta
 
@@ -86,8 +87,8 @@ magic "NM" | v u8 | kind u8 | seq u64 | len u32 | body | mac[32]
 }
 ```
 
-- `seq` 必须是已知 seq + 1；否则请求 snapshot。
-- `hops > 0` 时继续转发，`hops - 1`；fanout 最多 4。
+- `seq` must be the known sequence number plus one; otherwise the receiver requests a snapshot.
+- When `hops > 0`, the delta is forwarded with `hops - 1`; fanout is at most 4.
 
 ### Heartbeat
 
@@ -101,10 +102,10 @@ magic "NM" | v u8 | kind u8 | seq u64 | len u32 | body | mac[32]
 }
 ```
 
-- 每 `announce_interval` 发一次。
-- `seq` 严格更新才刷新 `last_seen`；重复/旧 heartbeat 不刷新。
-- `digest` 不匹配时向发送者请求 snapshot。
-- 超过 `origin_timeout` 没有更新，该 origin 的记录过期。
+- Sent every `announce_interval`.
+- Only a strictly newer `seq` refreshes `last_seen`; duplicate or old heartbeats do not.
+- A digest mismatch causes the receiver to request a snapshot from the sender.
+- If no update arrives within `origin_timeout`, the origin's records expire.
 
 ### Digest
 
@@ -116,10 +117,10 @@ magic "NM" | v u8 | kind u8 | seq u64 | len u32 | body | mac[32]
 }
 ```
 
-- 用于 anti-entropy；收到后比较本地状态：
-  - 本地缺失/落后 → `SyncRequest`；
-  - 本地更新 → 发送 snapshot。
-- 启动/连接建立时发送一次；之后每 60 秒随机 peer 一次。
+- Used for anti-entropy. On receipt, the local state is compared:
+  - local state missing or behind: send `SyncRequest`;
+  - local state ahead: send a snapshot.
+- Sent once on startup or connection establishment, then to a random peer every 60 seconds.
 
 ### SyncRequest
 
@@ -127,7 +128,7 @@ magic "NM" | v u8 | kind u8 | seq u64 | len u32 | body | mac[32]
 { "origins": [123, 456] }
 ```
 
-- 请求指定 origin 的完整 snapshot。
+- Requests a complete snapshot for the specified origins.
 
 ### Ping / Pong
 
@@ -135,7 +136,7 @@ magic "NM" | v u8 | kind u8 | seq u64 | len u32 | body | mac[32]
 { "nonce": 123 }
 ```
 
-- 保留的保活/诊断消息。
+- Reserved keepalive and diagnostic messages.
 
 ## State and conflict
 
@@ -149,17 +150,17 @@ NameEntry {
 }
 ```
 
-- 每个 origin 维护自己的 session/seq。
-- 同一个 name 的远端冲突：
-  1. `priority` 高者胜；
-  2. `version` 高者胜；
-  3. `owner` 小者胜。
-- 本地静态记录优先于远端记录。
-- 删除写 tombstone；低版本不能覆盖 tombstone。
-- 无持久化：重启产生新 session；旧 origin 在 `origin_timeout` 后过期。
+- Each origin maintains its own session and sequence number.
+- Remote conflicts for the same name are resolved by:
+  1. higher `priority`;
+  2. higher `version`;
+  3. lower `owner`.
+- Local static records take precedence over remote records.
+- Deletes are written as tombstones; an older version cannot overwrite a tombstone.
+- No persistence: a restart creates a new session; records from the old origin expire after `origin_timeout`.
 
 ## Limits
 
-- 单帧 1 MiB；snapshot 最多 1024 chunks；每 chunk 128 条记录。
-- 每个 peer 的发送队列 256 帧；满则丢弃并计数。
-- 握手 5 秒超时；连接建立后 5 秒内完成握手。
+- Maximum frame size is 1 MiB; a snapshot has at most 1024 chunks; each chunk holds at most 128 records.
+- Each peer has a 256-frame send queue; a full queue drops frames and increments a counter.
+- Handshake timeout is 5 seconds; the handshake must complete within 5 seconds of connecting.

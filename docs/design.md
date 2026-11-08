@@ -1,71 +1,73 @@
-# design notes
+# Design notes
 
 ## Goals
 
-- 去中心化：没有中心 registry；每个节点都能发布和解析记录。
-- 低运维：一个二进制、一个 TOML 主配置、一个 drop-in 目录。
-- 可增量部署：可以先只跑本地 DNS，再逐步加 peer。
+- **Decentralized:** no central registry; every node can publish and resolve records.
+- **Low operational overhead:** one binary, one main TOML file, one drop-in directory.
+- **Incremental deployment:** a node can start with local DNS only and add peers later.
 
 ## Key decisions
 
-### 独立于 cryonet
+### Independent of cryonet
 
-`namae` 只复用 cryonet registry 的思路：
+`namae` borrows only the registry ideas from cryonet:
 
-- 每个 origin 有 session/seq；
-- 冲突用 deterministic claim/tie-break；
-- fanout + hop limit + 周期 anti-entropy。
+- each origin has a session and sequence number;
+- conflicts are resolved with a deterministic claim/tie-break;
+- fanout, hop limits, and periodic anti-entropy.
 
-它不依赖 cryonet 的 mesh、UAPI 或 crypto。peer 发现只依赖系统路由表和手动 seed。
+It does not depend on cryonet's mesh, UAPI, or crypto. Peer discovery relies only on the system routing table and manual seeds.
 
-### 无持久化
+### No persistence
 
-- 不写 node-id、不缓存远端记录、不持久化 tombstone。
-- 启动后从 peer 拉 snapshot。
-- 重启产生新 session；旧 origin 在 `origin_timeout` 后过期。
-- 需要稳定身份时在配置里固定 `id`。
+- No node-id file, no cached remote records, no persisted tombstones.
+- A node pulls snapshots from peers after startup.
+- A restart creates a new session; records from the old origin expire after `origin_timeout`.
+- Set `id` explicitly when a stable identity is needed.
 
-### 部分 mesh
+### Partial mesh
 
-不要求 full mesh：
+A full mesh is not required:
 
-- heartbeat 携带 seq/digest，按 hop limit 转发；
-- 只有严格更新的 seq 才刷新 lease；
-- snapshot 应用后会继续转发；
-- 每 60 秒 digest anti-entropy。
+- heartbeats carry sequence numbers and digests and are forwarded with a hop limit;
+- only a strictly newer sequence number refreshes a lease;
+- applied snapshots are forwarded to other peers;
+- digest anti-entropy runs every 60 seconds.
 
-### 记录模型
+### Record model
 
-- `[[records]]` 同时覆盖静态值和 `from_interface` 动态值，不再区分 policy。
-- 本地静态记录优先于远端记录；`publish=false` 不进入 gossip。
-- 同一个名字选一个 winner：`priority` → `version` → `owner`（小者胜）。
+- `[[records]]` covers both static values and dynamic `from_interface` values; there is no separate policy type.
+- Local static records take precedence over remote records; `publish = false` stays local and is not gossiped.
+- One winner is selected per name: `priority`, then `version`, then the lower `owner`.
 
 ### DNS
 
-- 只做权威回答，不做递归/转发。
-- 非 zone 查询返回 `REFUSED`。
-- 不接 systemd-resolved/NSS/resolv.conf；这些是使用方的事情。
+- Authoritative answers only; no recursion or forwarding.
+- Queries outside the zone return `REFUSED`.
+- A process has one forward `zone`; `reverse_zones` are auxiliary and do not add a second forward zone.
+- A/AAAA records are also synthesized as PTR records under matching reverse zones. CNAME chains, ANY, wildcards, and SOA negative TTL are supported.
+- No systemd-resolved, NSS, or resolv.conf integration; that is left to the operator.
 
-### 安全
+### Security
 
-- v1 是 shared secret HMAC 俱乐部模型。
-- HMAC 认证成员，不区分具体节点；成员可以伪造名字。
-- 不加密 gossip 内容。
-- 需要防成员作恶时，后续加 Ed25519 per-node 签名。
+- v1 uses a shared-secret HMAC club model.
+- HMAC authenticates membership, not individual nodes; any member can forge names.
+- Gossip frames are authenticated but not encrypted.
+- Per-node Ed25519 signatures are the path for protecting against malicious members.
 
 ## Non-goals
 
-- L2/广播/组播发现。
-- full mesh 保证。
-- DNSSEC。
-- 状态持久化/审计/CRL。
-- NixOS module 或系统解析器集成。
-- Windows/macOS/wasm。
+- L2, broadcast, or multicast discovery.
+- A full-mesh guarantee.
+- DNSSEC.
+- State persistence, auditing, or CRLs.
+- A NixOS module or system resolver integration.
+- Windows, macOS, or wasm.
 
 ## Failure behavior
 
-- netlink monitor 不可用：启动失败。
-- 配置非法：启动失败；reload 时保留旧配置。
-- gossip 握手失败：关闭连接并计数；稍后重连。
-- 对端长时间无 heartbeat：origin 记录过期。
-- `zone`/`dns_listen`/`port`/`id` 变更：reload 拒绝或提示重启。
+- Netlink monitor unavailable: startup fails.
+- Invalid configuration: startup fails; reload keeps the previous configuration.
+- Gossip handshake failure: close the connection, count it, retry later.
+- No heartbeat from a peer for too long: the origin's records expire.
+- Changes to `zone`, `dns_listen`, `reverse_zones`, `port`, or `id`: reload rejects the change or asks for a restart.

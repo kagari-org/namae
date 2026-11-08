@@ -1,4 +1,5 @@
 zone = "namae."
+# reverse_zones = ["10.in-addr.arpa."]
 dns_listen = ["127.0.0.1:15353"]
 port = 7654
 secret = "change-me"

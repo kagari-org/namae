@@ -1,12 +1,12 @@
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
     str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -140,6 +140,7 @@ struct PeerSender {
 struct SnapshotAssembly {
     total: u32,
     chunks: Vec<Option<SnapshotMessage>>,
+    updated: Instant,
 }
 
 struct Shared {
@@ -368,6 +369,17 @@ fn bind_v6(port: u16) -> Result<TcpListener> {
     Ok(TcpListener::from_std(socket.into())?)
 }
 
+fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(addr) => SocketAddr::new(IpAddr::V4(*addr.ip()), port),
+        SocketAddr::V6(addr) => SocketAddr::V6(SocketAddrV6::new(
+            *addr.ip(),
+            port,
+            addr.flowinfo(),
+            addr.scope_id(),
+        )),
+    }
+}
 async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) -> Result<()> {
     loop {
         let (stream, addr) = listener.accept().await.context("accepting peer")?;
@@ -377,12 +389,14 @@ async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) -> Result<()> {
             let secret = shared.secret.load_full();
             let result = timeout(
                 Duration::from_secs(5),
-                server_handshake(stream, &secret, shared.local_id),
+                server_handshake(stream, &secret, shared.local_id, shared.port),
             )
             .await;
             match result {
                 Ok(Ok((stream, peer))) => {
-                    if let Err(error) = run_peer(shared, stream, peer.node_id, addr, false).await {
+                    if let Err(error) =
+                        run_peer(shared, stream, peer.node_id, peer.listen_port, addr, false).await
+                    {
                         debug!("peer {addr} disconnected: {error:?}");
                     }
                 }
@@ -489,24 +503,30 @@ async fn connect_peer(
     let secret = shared.secret.load_full();
     let (stream, peer) = timeout(
         Duration::from_secs(5),
-        client_handshake(stream, &secret, shared.local_id),
+        client_handshake(stream, &secret, shared.local_id, shared.port),
     )
     .await
     .context("handshake timeout")??;
     let _ = events.send(ConnectEvent::Connected(addr)).await;
-    run_peer(shared, stream, peer.node_id, addr, true).await
+    run_peer(shared, stream, peer.node_id, peer.listen_port, addr, true).await
 }
 
 async fn run_peer(
     shared: Arc<Shared>,
     stream: SecureStream<TcpStream>,
     peer_id: NodeId,
+    peer_port: u16,
     addr: SocketAddr,
     initiator: bool,
 ) -> Result<()> {
     if peer_id == shared.local_id {
         return Ok(());
     }
+    let peer_addr = if initiator {
+        addr
+    } else {
+        with_port(addr, peer_port)
+    };
     let preferred = initiator == (shared.local_id < peer_id);
     let conn_id = rand::random::<u64>();
     let (tx, mut rx) = mpsc::channel::<Frame>(256);
@@ -518,7 +538,7 @@ async fn run_peer(
                 let _ = existing.shutdown.send(true);
                 peers.remove(&peer_id);
             } else {
-                debug!("duplicate connection for node {peer_id:X}; closing {addr}");
+                debug!("duplicate connection for node {peer_id:X}; closing {peer_addr}");
                 return Ok(());
             }
         }
@@ -526,7 +546,7 @@ async fn run_peer(
             peer_id,
             PeerSender {
                 conn_id,
-                addr,
+                addr: peer_addr,
                 preferred,
                 tx: tx.clone(),
                 shutdown: shutdown_tx,
@@ -537,7 +557,7 @@ async fn run_peer(
         .stats
         .peer_count
         .store(shared.peers.read().await.len() as u64, Ordering::Relaxed);
-    info!("peer {peer_id:X} connected at {addr}");
+    info!("peer {peer_id:X} connected at {peer_addr}");
 
     let (reader, mut writer) = stream.split();
     let mut writer_shutdown = shutdown_rx.clone();
@@ -838,15 +858,18 @@ async fn handle_snapshot(shared: &Shared, peer_id: NodeId, message: SnapshotMess
         let assembly = snapshots.entry(key).or_insert_with(|| SnapshotAssembly {
             total: message.total,
             chunks: vec![None; message.total as usize],
+            updated: Instant::now(),
         });
         if assembly.total != message.total {
             *assembly = SnapshotAssembly {
                 total: message.total,
                 chunks: vec![None; message.total as usize],
+                updated: Instant::now(),
             };
         }
         let chunk_index = message.chunk as usize;
         assembly.chunks[chunk_index] = Some(message);
+        assembly.updated = Instant::now();
         if assembly.chunks.iter().any(Option::is_none) {
             return Ok(());
         }
@@ -1135,6 +1158,13 @@ async fn gc_loop(shared: Arc<Shared>) {
     let mut ticker = interval(Duration::from_secs(10));
     loop {
         ticker.tick().await;
+        {
+            let now = Instant::now();
+            let mut snapshots = shared.snapshots.lock().await;
+            snapshots.retain(|_, assembly| {
+                now.duration_since(assembly.updated) < Duration::from_secs(60)
+            });
+        }
         let changed = shared
             .store
             .write()
@@ -1345,8 +1375,8 @@ mod integration_tests {
             rand::random(),
         )));
 
-        let _gossip1 = start(store1, config1, vec![peer(port2)]).await.unwrap();
-        let _gossip2 = start(store2.clone(), config2, vec![peer(port1)])
+        let gossip1 = start(store1, config1, vec![peer(port2)]).await.unwrap();
+        let gossip2 = start(store2.clone(), config2, vec![peer(port1)])
             .await
             .unwrap();
 
@@ -1362,6 +1392,32 @@ mod integration_tests {
         assert!(entry.records.iter().any(|record| {
             matches!(&record.data, RecordData::A(ip) if ip.to_string() == "10.0.0.1")
         }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if gossip1.peer_count().await == 1 && gossip2.peer_count().await == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "nodes did not keep a single peer"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        gossip1.set_secret(b"rotated-secret".to_vec()).await;
+        gossip2.set_secret(b"rotated-secret".to_vec()).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if gossip1.peer_count().await == 1 && gossip2.peer_count().await == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "nodes did not reconnect after secret rotation"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(store2.read().await.resolve(&name).is_some());
     }
 }
 
