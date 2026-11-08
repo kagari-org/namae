@@ -1,0 +1,6 @@
+[[records]]
+name = "host.namae."
+type = "A"
+from_interface = "eth0"
+ttl = 60
+publish = true

@@ -1,0 +1,21 @@
+zone = "namae."
+dns_listen = ["127.0.0.1:15353"]
+port = 7654
+secret = "change-me"
+proto = "bird"
+default_ttl = 60
+negative_ttl = 30
+
+[[records]]
+name = "router"
+type = "A"
+value = "10.0.0.1"
+ttl = 300
+priority = 100
+publish = true
+
+[[records]]
+name = "router.namae."
+type = "AAAA"
+value = "fd00::1"
+ttl = 300
