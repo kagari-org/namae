@@ -136,7 +136,7 @@ At startup, `namae` dumps the routing table and subscribes to netlink route upda
 - it is a unicast route in the main table;
 - it is an IPv4 `/32` or an IPv6 `/128`.
 
-The destination address becomes the peer address; for IPv6, `RTA_OIF` supplies the scope ID. Manual `seeds` are always merged in, and local addresses are excluded. Route monitoring is required; if netlink monitor is unavailable, `namae` exits instead of silently falling back to polling.
+The destination address becomes the peer address; for IPv6, `RTA_OIF` supplies the scope ID. Manual `seeds` are always merged in, and local addresses are excluded. Route monitoring is required; if netlink monitor is unavailable, `namae` exits instead of silently falling back to polling. Failed connection attempts use exponential backoff from 1 second to 60 seconds with jitter, so routes that do not run `namae` are probed only occasionally; a successful connection resets the backoff.
 
 ### Gossip
 
@@ -220,9 +220,10 @@ DIG=$(command -v dig) ./tests/netns_e2e.sh
 DIG=$(command -v dig) TC=$(command -v tc) ./tests/netns_chaos.sh
 DIG=$(command -v dig) TC=$(command -v tc) ./tests/netns_scale.sh
 DIG=$(command -v dig) ./tests/netns_mem.sh
+./tests/netns_backoff.sh
 ```
 
-`netns_e2e.sh` covers a three-node partial mesh, PTR, and route flap. `netns_chaos.sh` covers a four-node ring, partition and heal, 10% packet loss on both links of a node, node offline record expiry, and restart/resync. `netns_scale.sh` covers a six-node ring with a chord, split-brain partition, node loss/restart, packet loss on both links of a node, hot reload, and delete propagation. `netns_mem.sh` repeatedly restarts nodes, flaps routes, and hot-reloads unique records while checking RSS, thread count, and file descriptors.
+`netns_e2e.sh` covers a three-node partial mesh, PTR, and route flap. `netns_chaos.sh` covers a four-node ring, partition and heal, 10% packet loss on both links of a node, node offline record expiry, and restart/resync. `netns_scale.sh` covers a six-node ring with a chord, split-brain partition, node loss/restart, packet loss on both links of a node, hot reload, and delete propagation. `netns_mem.sh` repeatedly restarts nodes, flaps routes, and hot-reloads unique records while checking RSS, thread count, and file descriptors. `netns_backoff.sh` verifies that a route without `namae` is retried with increasing delays and stops retrying when the route is removed.
 
 ## Documentation
 

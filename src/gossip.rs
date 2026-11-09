@@ -35,6 +35,14 @@ const SNAPSHOT_CHUNK: usize = 128;
 const MAX_SNAPSHOT_CHUNKS: u32 = 1024;
 const MAX_SNAPSHOT_ASSEMBLIES: usize = 64;
 
+const CONNECT_RETRY_MAX: Duration = Duration::from_secs(60);
+
+fn retry_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    let base_ms = 1000u64 << shift;
+    let jitter = rand::random_range(80..=120);
+    Duration::from_millis(base_ms * jitter / 100).min(CONNECT_RETRY_MAX)
+}
 #[derive(Default)]
 pub struct GossipStats {
     pub frames_in: AtomicU64,
@@ -439,19 +447,26 @@ async fn connector(
     let mut desired: HashMap<SocketAddr, ()> = HashMap::new();
     let mut connecting: HashMap<SocketAddr, JoinHandle<()>> = HashMap::new();
     let mut connected: HashMap<SocketAddr, ()> = HashMap::new();
+    let mut attempts: HashMap<SocketAddr, u32> = HashMap::new();
+    let mut next_attempt: HashMap<SocketAddr, Instant> = HashMap::new();
     let mut ticker = interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             Some(command) = commands.recv() => {
                 match command {
                     PeerCommand::Add(addr) => {
-                        desired.insert(addr, ());
+                        if desired.insert(addr, ()).is_none() {
+                            attempts.remove(&addr);
+                            next_attempt.remove(&addr);
+                        }
                     }
                     PeerCommand::ReconnectAll => {
                         for (_, task) in connecting.drain() {
                             task.abort();
                         }
                         connected.clear();
+                        attempts.clear();
+                        next_attempt.clear();
                     }
                     PeerCommand::Remove(addr) => {
                         desired.remove(&addr);
@@ -459,6 +474,8 @@ async fn connector(
                             task.abort();
                         }
                         connected.remove(&addr);
+                        attempts.remove(&addr);
+                        next_attempt.remove(&addr);
                         let mut peers = shared.peers.write().await;
                         let node = peers
                             .iter()
@@ -476,15 +493,49 @@ async fn connector(
                 match event {
                     ConnectEvent::Connected(addr) => {
                         connecting.remove(&addr);
-                        connected.insert(addr, ());
+                        attempts.remove(&addr);
+                        next_attempt.remove(&addr);
+                        if desired.contains_key(&addr) {
+                            connected.insert(addr, ());
+                        } else {
+                            let mut peers = shared.peers.write().await;
+                            let node = peers
+                                .iter()
+                                .find(|(_, peer)| peer.addr == addr)
+                                .map(|(node, _)| *node);
+                            if let Some(node) = node
+                                && let Some(peer) = peers.remove(&node)
+                            {
+                                let _ = peer.shutdown.send(true);
+                            }
+                        }
                     }
                     ConnectEvent::Disconnected(addr) => {
+                        let was_connected = connected.remove(&addr).is_some();
                         connecting.remove(&addr);
-                        connected.remove(&addr);
+                        if !desired.contains_key(&addr) {
+                            attempts.remove(&addr);
+                            next_attempt.remove(&addr);
+                        } else if was_connected {
+                            attempts.remove(&addr);
+                            next_attempt.insert(addr, Instant::now());
+                        } else {
+                            let attempt = {
+                                let attempt = attempts.entry(addr).or_insert(0);
+                                *attempt = attempt.saturating_add(1);
+                                *attempt
+                            };
+                            let delay = retry_delay(attempt);
+                            debug!(
+                                "connect {addr} failed; retrying in {delay:?} (attempt {attempt})"
+                            );
+                            next_attempt.insert(addr, Instant::now() + delay);
+                        }
                     }
                 }
             }
             _ = ticker.tick() => {
+                let now = Instant::now();
                 for addr in desired.keys().copied() {
                     if connected.contains_key(&addr) && !shared.has_peer_addr(addr).await {
                         connected.remove(&addr);
@@ -493,6 +544,9 @@ async fn connector(
                         || connecting.contains_key(&addr)
                         || shared.has_peer_addr(addr).await
                     {
+                        continue;
+                    }
+                    if next_attempt.get(&addr).is_some_and(|next| now < *next) {
                         continue;
                     }
                     let shared = shared.clone();
@@ -1342,6 +1396,14 @@ mod tests {
                 data: RecordData::A(ip.parse().unwrap()),
             }],
         }
+    }
+
+    #[test]
+    fn retry_delay_backs_off_and_caps() {
+        let first = retry_delay(1);
+        assert!(first >= Duration::from_millis(800));
+        assert!(first <= Duration::from_millis(1200));
+        assert_eq!(retry_delay(20), CONNECT_RETRY_MAX);
     }
 
     #[test]
