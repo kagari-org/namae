@@ -375,6 +375,7 @@ impl Store {
             .is_none_or(|meta| meta.session != session);
         if session_changed {
             self.remote.remove(&origin);
+            self.tombstones.retain(|(owner, _), _| *owner != origin);
             changed = true;
         }
         let target = self.remote.entry(origin).or_default();
@@ -482,6 +483,15 @@ impl Store {
         seq: u64,
         digest: [u8; 16],
     ) -> HeartbeatOutcome {
+        let session_changed = self
+            .meta
+            .get(&origin)
+            .is_some_and(|meta| meta.session != session);
+        if session_changed {
+            self.remote.remove(&origin);
+            self.remote_digests.remove(&origin);
+            self.tombstones.retain(|(owner, _), _| *owner != origin);
+        }
         let updated = match self.meta.get_mut(&origin) {
             None => {
                 self.meta.insert(
@@ -848,6 +858,37 @@ mod tests {
                 .versions
                 .contains_key(&Name::from_str("b.namae.").unwrap())
         );
+    }
+
+    #[test]
+    fn new_session_drops_stale_tombstones() {
+        let mut store = Store::new(zone(), 1, 1);
+        let name = Name::from_str("a.namae.").unwrap();
+        store
+            .apply_snapshot(
+                2,
+                1,
+                1,
+                vec![(name.clone(), entry(2, 1, "10.0.0.2"))],
+                vec![],
+            )
+            .is_applied();
+        store
+            .apply_delta(2, 1, 2, vec![], vec![(name.clone(), 2)])
+            .is_applied();
+        assert!(store.resolve(&name).is_none());
+        store
+            .apply_snapshot(
+                2,
+                2,
+                1,
+                vec![(name.clone(), entry(2, 1, "10.0.0.2"))],
+                vec![],
+            )
+            .is_applied();
+        assert!(store.resolve(&name).is_some());
+        let (_, _, _, tombstones) = store.snapshot_for(2).unwrap();
+        assert!(!tombstones.iter().any(|(tombstone, _)| tombstone == &name));
     }
 
     trait ApplyExt {
