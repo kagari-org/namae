@@ -104,7 +104,7 @@ pub async fn run(config_path: PathBuf, config_dir: PathBuf, ctl_path: PathBuf) -
         })
     };
 
-    let (watch_tx, mut watch_rx) = mpsc::unbounded_channel();
+    let (watch_tx, mut watch_rx) = mpsc::channel(16);
     let _watcher = build_watcher(
         watch_tx,
         &config_path,
@@ -178,7 +178,7 @@ pub async fn run(config_path: PathBuf, config_dir: PathBuf, ctl_path: PathBuf) -
 }
 
 fn build_watcher(
-    tx: mpsc::UnboundedSender<()>,
+    tx: mpsc::Sender<()>,
     config_path: &Path,
     config_dir: &Path,
     secret_file: Option<&Path>,
@@ -215,7 +215,7 @@ fn build_watcher(
                 || filter_secret.as_ref().is_some_and(|secret| path == secret)
         });
         if relevant {
-            let _ = tx.send(());
+            let _ = tx.try_send(());
         }
     })
     .context("creating config watcher")?;

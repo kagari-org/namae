@@ -126,6 +126,11 @@ pub struct OriginMeta {
     pub seq: u64,
     pub last_seen: Instant,
 }
+#[derive(Clone, Debug)]
+struct VersionMeta {
+    version: u64,
+    last_used: Instant,
+}
 
 #[derive(Clone, Debug)]
 pub struct OriginDigest {
@@ -164,7 +169,7 @@ pub struct Store {
     meta: HashMap<NodeId, OriginMeta>,
     tombstones: HashMap<(NodeId, Name), (u64, Instant)>,
     remote_digests: HashMap<NodeId, [u8; 16]>,
-    versions: HashMap<Name, u64>,
+    versions: HashMap<Name, VersionMeta>,
 }
 
 impl Store {
@@ -265,13 +270,16 @@ impl Store {
         let mut diff = LocalDiff::default();
         let mut next_local: BTreeMap<Name, LocalEntry> = BTreeMap::new();
         for (name, (records, ttl, priority, publish)) in grouped {
-            if records.is_empty() {
-                continue;
-            }
+            let now = Instant::now();
+            let meta = self.versions.entry(name.clone()).or_insert(VersionMeta {
+                version: 0,
+                last_used: now,
+            });
+            meta.last_used = now;
             let mut entry = NameEntry {
                 owner: self.local_id,
                 priority,
-                version: *self.versions.get(&name).unwrap_or(&0),
+                version: meta.version,
                 ttl,
                 records,
             };
@@ -284,9 +292,8 @@ impl Store {
                     || previous.publish != publish
             });
             if previous.is_none() || changed {
-                let version = self.versions.entry(name.clone()).or_insert(0);
-                *version = version.wrapping_add(1);
-                entry.version = *version;
+                meta.version = meta.version.wrapping_add(1);
+                entry.version = meta.version;
                 if publish {
                     diff.upserts.push((name.clone(), entry.clone()));
                 } else if previous.is_some_and(|previous| previous.publish) {
@@ -303,13 +310,17 @@ impl Store {
             let Some(previous) = self.local.get(name) else {
                 continue;
             };
-            let version = self.versions.entry(name.clone()).or_insert(0);
-            *version = version.wrapping_add(1);
+            let now = Instant::now();
+            let version = self.versions.entry(name.clone()).or_insert(VersionMeta {
+                version: 0,
+                last_used: now,
+            });
+            version.version = version.version.wrapping_add(1);
+            version.last_used = now;
             if previous.publish {
-                diff.deletes.push((name.clone(), *version));
+                diff.deletes.push((name.clone(), version.version));
             }
         }
-
         self.local = next_local;
         if !diff.is_empty() {
             self.local_seq = self.local_seq.wrapping_add(1);
@@ -565,6 +576,10 @@ impl Store {
             changed |= !keep;
             keep
         });
+        let local = &self.local;
+        self.versions.retain(|name, meta| {
+            local.contains_key(name) || now.duration_since(meta.last_used) <= tombstone_ttl
+        });
         changed
     }
 
@@ -786,6 +801,53 @@ mod tests {
         );
         assert!(matches!(result, ApplyResult::Applied { changed: true }));
         assert!(store.resolve(&name).is_some());
+    }
+
+    #[test]
+    fn stale_local_versions_are_pruned() {
+        let mut store = Store::new(zone(), 1, 1);
+        let names = ["a.namae.", "b.namae."];
+        for name in names {
+            store
+                .set_local_records(
+                    &[ResolvedRecord {
+                        name: Name::from_str(name).unwrap(),
+                        rtype: RecordType::A,
+                        target: RecordTarget::Value(RecordData::A("10.0.0.1".parse().unwrap())),
+                        ttl: Some(60),
+                        priority: 100,
+                        publish: true,
+                    }],
+                    &HashMap::new(),
+                    60,
+                )
+                .unwrap();
+        }
+        store
+            .set_local_records(
+                &[ResolvedRecord {
+                    name: Name::from_str("a.namae.").unwrap(),
+                    rtype: RecordType::A,
+                    target: RecordTarget::Value(RecordData::A("10.0.0.1".parse().unwrap())),
+                    ttl: Some(60),
+                    priority: 100,
+                    publish: true,
+                }],
+                &HashMap::new(),
+                60,
+            )
+            .unwrap();
+        store.expire(Duration::ZERO, Duration::ZERO);
+        assert!(
+            store
+                .versions
+                .contains_key(&Name::from_str("a.namae.").unwrap())
+        );
+        assert!(
+            !store
+                .versions
+                .contains_key(&Name::from_str("b.namae.").unwrap())
+        );
     }
 
     trait ApplyExt {

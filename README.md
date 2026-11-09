@@ -218,9 +218,11 @@ An end-to-end namespace test is available:
 cargo build
 DIG=$(command -v dig) ./tests/netns_e2e.sh
 DIG=$(command -v dig) TC=$(command -v tc) ./tests/netns_chaos.sh
+DIG=$(command -v dig) TC=$(command -v tc) ./tests/netns_scale.sh
+DIG=$(command -v dig) ./tests/netns_mem.sh
 ```
 
-`netns_e2e.sh` covers a three-node partial mesh, PTR, and route flap. `netns_chaos.sh` covers a four-node ring, partition and heal, 10% packet loss on both links of a node, node offline record expiry, and restart/resync.
+`netns_e2e.sh` covers a three-node partial mesh, PTR, and route flap. `netns_chaos.sh` covers a four-node ring, partition and heal, 10% packet loss on both links of a node, node offline record expiry, and restart/resync. `netns_scale.sh` covers a six-node ring with a chord, split-brain partition, node loss/restart, packet loss on both links of a node, hot reload, and delete propagation. `netns_mem.sh` repeatedly restarts nodes, flaps routes, and hot-reloads unique records while checking RSS, thread count, and file descriptors.
 
 ## Documentation
 

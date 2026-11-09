@@ -33,6 +33,7 @@ const HOP_LIMIT: u8 = 6;
 const FANOUT: usize = 4;
 const SNAPSHOT_CHUNK: usize = 128;
 const MAX_SNAPSHOT_CHUNKS: u32 = 1024;
+const MAX_SNAPSHOT_ASSEMBLIES: usize = 64;
 
 #[derive(Default)]
 pub struct GossipStats {
@@ -134,6 +135,13 @@ struct PeerSender {
     addr: SocketAddr,
     tx: mpsc::Sender<Frame>,
     shutdown: watch::Sender<bool>,
+}
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 struct SnapshotAssembly {
@@ -592,19 +600,31 @@ async fn run_peer(
 
     let (reader, mut writer) = stream.split();
     let mut writer_shutdown = shutdown_rx.clone();
-    let writer_task = tokio::spawn(async move {
+    let _writer = AbortOnDrop(tokio::spawn(async move {
         loop {
             tokio::select! {
                 Some(frame) = rx.recv() => {
-                    if let Err(error) = writer.send(frame.kind, &frame.body).await {
-                        debug!("writer for {peer_id:X} stopped: {error:?}");
-                        break;
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        writer.send(frame.kind, &frame.body),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            debug!("writer for {peer_id:X} stopped: {error:?}");
+                            break;
+                        }
+                        Err(_) => {
+                            debug!("writer for {peer_id:X} timed out");
+                            break;
+                        }
                     }
                 }
                 _ = writer_shutdown.changed() => break,
             }
         }
-    });
+    }));
 
     let _ = send_own_snapshot(&shared, &tx).await;
     if let Ok(digest) = shared.digest_message().await {
@@ -612,25 +632,29 @@ async fn run_peer(
     }
 
     let mut reader = reader;
+    let idle = (shared.announce_interval * 3).max(Duration::from_secs(30));
     let result = loop {
         tokio::select! {
-            frame = reader.recv() => {
+            frame = tokio::time::timeout(idle, reader.recv()) => {
                 match frame {
-                    Ok(frame) => {
+                    Ok(Ok(frame)) => {
                         shared.stats.frames_in.fetch_add(1, Ordering::Relaxed);
                         if let Err(error) = handle_frame(&shared, peer_id, frame, &tx).await {
                             shared.stats.errors.fetch_add(1, Ordering::Relaxed);
                             debug!("frame from {peer_id:X} failed: {error:?}");
                         }
                     }
-                    Err(error) => break Err(error.into()),
+                    Ok(Err(error)) => break Err(error.into()),
+                    Err(_) => {
+                        debug!("reader for {peer_id:X} idle timeout");
+                        break Ok(());
+                    }
                 }
             }
             _ = shutdown_rx.changed() => break Ok(()),
         }
     };
 
-    writer_task.abort();
     let mut peers = shared.peers.write().await;
     if peers
         .get(&peer_id)
@@ -886,6 +910,15 @@ async fn handle_snapshot(shared: &Shared, peer_id: NodeId, message: SnapshotMess
     if message.total > 1 {
         let mut snapshots = shared.snapshots.lock().await;
         let key = (origin, session, seq);
+        if !snapshots.contains_key(&key)
+            && snapshots.len() >= MAX_SNAPSHOT_ASSEMBLIES
+            && let Some(oldest) = snapshots
+                .iter()
+                .min_by_key(|(_, assembly)| assembly.updated)
+                .map(|(key, _)| *key)
+        {
+            snapshots.remove(&oldest);
+        }
         let assembly = snapshots.entry(key).or_insert_with(|| SnapshotAssembly {
             total: message.total,
             chunks: vec![None; message.total as usize],
@@ -1194,6 +1227,17 @@ async fn gc_loop(shared: Arc<Shared>) {
     let mut ticker = interval(Duration::from_secs(10));
     loop {
         ticker.tick().await;
+        {
+            let mut peers = shared.peers.write().await;
+            let before = peers.len();
+            peers.retain(|_, peer| !peer.tx.is_closed());
+            if peers.len() != before {
+                shared
+                    .stats
+                    .peer_count
+                    .store(peers.len() as u64, Ordering::Relaxed);
+            }
+        }
         {
             let now = Instant::now();
             let mut snapshots = shared.snapshots.lock().await;
