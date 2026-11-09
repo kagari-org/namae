@@ -217,9 +217,10 @@ An end-to-end namespace test is available:
 ```sh
 cargo build
 DIG=$(command -v dig) ./tests/netns_e2e.sh
+DIG=$(command -v dig) TC=$(command -v tc) ./tests/netns_chaos.sh
 ```
 
-It builds three network namespaces connected as `n1 ↔ n2 ↔ n3`, with `n1` and `n3` only knowing `n2`, and verifies two-hop gossip and DNS behavior.
+`netns_e2e.sh` covers a three-node partial mesh, PTR, and route flap. `netns_chaos.sh` covers a four-node ring, partition and heal, 10% packet loss on both links of a node, node offline record expiry, and restart/resync.
 
 ## Documentation
 

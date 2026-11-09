@@ -353,7 +353,7 @@ impl Store {
     ) -> ApplyResult {
         if let Some(meta) = self.meta.get(&origin)
             && meta.session == session
-            && seq <= meta.seq
+            && seq < meta.seq
         {
             return ApplyResult::Stale;
         }
@@ -770,6 +770,22 @@ mod tests {
             .is_applied();
         store.apply_snapshot(2, 2, 1, vec![], vec![]).is_applied();
         assert!(store.resolve(&name).is_none());
+    }
+
+    #[test]
+    fn heartbeat_then_snapshot_at_same_seq_applies() {
+        let mut store = Store::new(zone(), 1, 10);
+        let name = Name::from_str("a.namae.").unwrap();
+        store.heartbeat(2, 1, 5, [0u8; 16]);
+        let result = store.apply_snapshot(
+            2,
+            1,
+            5,
+            vec![(name.clone(), entry(2, 1, "10.0.0.2"))],
+            vec![],
+        );
+        assert!(matches!(result, ApplyResult::Applied { changed: true }));
+        assert!(store.resolve(&name).is_some());
     }
 
     trait ApplyExt {

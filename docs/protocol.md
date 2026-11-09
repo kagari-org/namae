@@ -23,6 +23,7 @@ C -> S: ClientAuth  { mac_c = HMAC(secret, "namae/1 client" || nonce_c || nonce_
   - `k_s2c = HKDF(secret, salt = nonce_c || nonce_s, info = "namae/1 s2c")`
 - Handshake timeout is 5 seconds; handshake frames are limited to 4 KiB.
 - `listen_port` lets the receiver turn an inbound TCP connection's ephemeral source port into the peer's gossip listen address.
+- For each pair, the lower node ID initiates; the higher ID accepts. A non-preferred inbound connection is closed, and the lower-ID node learns the peer address and initiates its own connection.
 - A wrong secret, a bad MAC, or a replay closes the connection.
 
 ## Frame

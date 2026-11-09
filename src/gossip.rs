@@ -132,7 +132,6 @@ pub struct PeerInfo {
 struct PeerSender {
     conn_id: u64,
     addr: SocketAddr,
-    preferred: bool,
     tx: mpsc::Sender<Frame>,
     shutdown: watch::Sender<bool>,
 }
@@ -155,6 +154,7 @@ struct Shared {
     tombstone_ttl: Duration,
     peers: RwLock<HashMap<NodeId, PeerSender>>,
     change_tx: broadcast::Sender<()>,
+    command_tx: mpsc::Sender<PeerCommand>,
     stats: Arc<GossipStats>,
     snapshots: Mutex<HashMap<(NodeId, u64, u64), SnapshotAssembly>>,
 }
@@ -280,6 +280,7 @@ pub async fn start(
     initial_peers: Vec<Peer>,
 ) -> Result<GossipHandle> {
     let (change_tx, _) = broadcast::channel(64);
+    let (command_tx, command_rx) = mpsc::channel(256);
     let shared = Arc::new(Shared {
         zone: config.zone.clone(),
         local_id: config.node_id(),
@@ -294,6 +295,7 @@ pub async fn start(
         change_tx,
         stats: Arc::new(GossipStats::default()),
         snapshots: Mutex::new(HashMap::new()),
+        command_tx: command_tx.clone(),
     });
     let mut listeners = Vec::new();
 
@@ -317,7 +319,6 @@ pub async fn start(
         });
     }
 
-    let (command_tx, command_rx) = mpsc::channel(256);
     let (event_tx, event_rx) = mpsc::channel(256);
     {
         let shared = shared.clone();
@@ -394,8 +395,16 @@ async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) -> Result<()> {
             .await;
             match result {
                 Ok(Ok((stream, peer))) => {
-                    if let Err(error) =
-                        run_peer(shared, stream, peer.node_id, peer.listen_port, addr, false).await
+                    if let Err(error) = run_peer(
+                        shared,
+                        stream,
+                        peer.node_id,
+                        peer.listen_port,
+                        addr,
+                        false,
+                        None,
+                    )
+                    .await
                     {
                         debug!("peer {addr} disconnected: {error:?}");
                     }
@@ -469,6 +478,9 @@ async fn connector(
             }
             _ = ticker.tick() => {
                 for addr in desired.keys().copied() {
+                    if connected.contains_key(&addr) && !shared.has_peer_addr(addr).await {
+                        connected.remove(&addr);
+                    }
                     if connected.contains_key(&addr)
                         || connecting.contains_key(&addr)
                         || shared.has_peer_addr(addr).await
@@ -507,8 +519,16 @@ async fn connect_peer(
     )
     .await
     .context("handshake timeout")??;
-    let _ = events.send(ConnectEvent::Connected(addr)).await;
-    run_peer(shared, stream, peer.node_id, peer.listen_port, addr, true).await
+    run_peer(
+        shared,
+        stream,
+        peer.node_id,
+        peer.listen_port,
+        addr,
+        true,
+        Some(events),
+    )
+    .await
 }
 
 async fn run_peer(
@@ -518,6 +538,7 @@ async fn run_peer(
     peer_port: u16,
     addr: SocketAddr,
     initiator: bool,
+    connected_tx: Option<mpsc::Sender<ConnectEvent>>,
 ) -> Result<()> {
     if peer_id == shared.local_id {
         return Ok(());
@@ -528,26 +549,33 @@ async fn run_peer(
         with_port(addr, peer_port)
     };
     let preferred = initiator == (shared.local_id < peer_id);
+    if !preferred {
+        if !initiator {
+            let _ = shared.command_tx.try_send(PeerCommand::Add(peer_addr));
+        }
+        debug!("closing non-preferred connection with {peer_id:X} at {peer_addr}");
+        return Ok(());
+    }
     let conn_id = rand::random::<u64>();
     let (tx, mut rx) = mpsc::channel::<Frame>(256);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     {
         let mut peers = shared.peers.write().await;
-        if let Some(existing) = peers.get(&peer_id) {
-            if preferred && !existing.preferred {
-                let _ = existing.shutdown.send(true);
-                peers.remove(&peer_id);
-            } else {
-                debug!("duplicate connection for node {peer_id:X}; closing {peer_addr}");
-                return Ok(());
-            }
+        let existing_closed = peers
+            .get(&peer_id)
+            .is_some_and(|existing| existing.tx.is_closed());
+        if existing_closed {
+            peers.remove(&peer_id);
+        }
+        if peers.contains_key(&peer_id) {
+            debug!("duplicate connection for node {peer_id:X}; closing {peer_addr}");
+            return Ok(());
         }
         peers.insert(
             peer_id,
             PeerSender {
                 conn_id,
                 addr: peer_addr,
-                preferred,
                 tx: tx.clone(),
                 shutdown: shutdown_tx,
             },
@@ -557,6 +585,9 @@ async fn run_peer(
         .stats
         .peer_count
         .store(shared.peers.read().await.len() as u64, Ordering::Relaxed);
+    if let Some(tx) = connected_tx {
+        let _ = tx.send(ConnectEvent::Connected(addr)).await;
+    }
     info!("peer {peer_id:X} connected at {peer_addr}");
 
     let (reader, mut writer) = stream.split();
@@ -649,7 +680,7 @@ impl Shared {
             .read()
             .await
             .values()
-            .any(|peer| peer.addr == addr)
+            .any(|peer| peer.addr == addr && !peer.tx.is_closed())
     }
 
     async fn digest_message(&self) -> Result<DigestMessage> {
@@ -971,6 +1002,7 @@ async fn apply_snapshot(
         .write()
         .await
         .apply_snapshot(origin, session, seq, entries, tombstones);
+    debug!("snapshot from {origin:X} session {session} seq {seq}: {result:?}");
     shared.stats.snapshots_in.fetch_add(1, Ordering::Relaxed);
     let changed = matches!(result, ApplyResult::Applied { changed: true });
     if changed {
@@ -1047,6 +1079,10 @@ async fn handle_heartbeat(
         message.session,
         message.seq,
         message.digest,
+    );
+    debug!(
+        "heartbeat from {:X} session {} seq {}: updated={} needs_sync={}",
+        message.origin, message.session, message.seq, outcome.updated, outcome.needs_sync
     );
     shared.stats.heartbeats_in.fetch_add(1, Ordering::Relaxed);
     if outcome.needs_sync {
