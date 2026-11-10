@@ -19,7 +19,6 @@ hkdf = "0.12"
 hmac = "0.12"
 humantime = "2"
 libc = "0.2"
-notify = "8"
 rand = "0.9"
 rtnetlink = "0.24"
 serde = { version = "1", features = ["derive"] }

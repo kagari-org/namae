@@ -19,7 +19,7 @@ records ──────────────► local DNS server ───
 - **Route-driven peer discovery** — reads `proto bird` host routes from netlink; IPv4 `/32` and IPv6 `/128` routes become peers.
 - **Works with partial connectivity** — heartbeat, delta, and digest anti-entropy keep records moving across multiple hops; a full mesh is not required.
 - **Authoritative local DNS** — serves `A`, `AAAA`, `CNAME`, `TXT`, wildcard, and synthesized `PTR` records for a private zone.
-- **Hot-reloadable configuration** — a main TOML file plus a drop-in directory.
+- **Reloadable configuration** — a main TOML file plus a drop-in directory.
 - **Stateless by design** — no record database, no node-id file; a restarted node resynchronizes from its peers.
 - **Authenticated gossip** — HMAC-SHA256 handshake and per-frame authentication with a shared secret.
 - **Small operational surface** — one daemon, one control socket, no external database.
@@ -176,9 +176,9 @@ namae ctl sync
 
 The default control socket is `/run/namae/ctl.sock`; override it with `--socket`.
 
-## Hot reload
+## Reload
 
-The main config, the drop-in directory, and `secret_file` are watched. Reload can also be triggered with `SIGHUP` or `namae ctl reload`.
+The daemon does not watch files. After changing the main config, a drop-in, or `secret_file`, run `namae ctl reload` or send `SIGHUP`.
 
 - Valid configuration is swapped atomically.
 - Invalid configuration is rejected and the previous one stays active.
@@ -224,7 +224,7 @@ DIG=$(command -v dig) ./tests/netns_mem.sh
 ./tests/netns_backoff.sh
 ```
 
-`netns_e2e.sh` covers a three-node partial mesh, PTR, and route flap. `netns_chaos.sh` covers a four-node ring, partition and heal, 10% packet loss on both links of a node, node offline record expiry, and restart/resync. `netns_scale.sh` covers a six-node ring with a chord, split-brain partition, node loss/restart, packet loss on both links of a node, hot reload, and delete propagation. `netns_mem.sh` repeatedly restarts nodes, flaps routes, and hot-reloads unique records while checking RSS, thread count, and file descriptors. `netns_backoff.sh` verifies that a route without `namae` is retried with increasing delays and stops retrying when the route is removed.
+`netns_e2e.sh` covers a three-node partial mesh, PTR, and route flap. `netns_chaos.sh` covers a four-node ring, partition and heal, 10% packet loss on both links of a node, node offline record expiry, and restart/resync. `netns_scale.sh` covers a six-node ring with a chord, split-brain partition, node loss/restart, packet loss on both links of a node, explicit reload, and delete propagation. `netns_mem.sh` repeatedly restarts nodes, flaps routes, and explicitly reloads unique records while checking RSS, thread count, and file descriptors. `netns_backoff.sh` verifies that a route without `namae` is retried with increasing delays and stops retrying when the route is removed.
 
 ## Documentation
 

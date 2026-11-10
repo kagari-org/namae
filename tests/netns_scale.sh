@@ -165,6 +165,10 @@ for n in 1 2 3 4 5 6; do
     [ -S "$TMP/n$n.sock" ] || fail "node n$n did not start"
 done
 
+reload_node() {
+    "$BIN" ctl --socket "$TMP/n$1.sock" reload >/dev/null
+}
+
 resolve() {
     local ns=$1 name=$2
     ip netns exec "$ns" "$DIG" @127.0.0.1 -p 15353 +short +time=1 +tries=1 "$name" A 2>/dev/null || true
@@ -237,6 +241,8 @@ type = "A"
 value = "10.0.0.15"
 publish = true
 CONFIG
+reload_node 2
+reload_node 5
 wait_for "$N1" "left.namae." "10.0.0.12"
 wait_for "$N6" "right.namae." "10.0.0.15"
 sleep 2
@@ -280,6 +286,7 @@ type = "A"
 value = "10.0.0.33"
 publish = true
 CONFIG
+reload_node 3
 wait_for "$N1" "scale-loss.namae." "10.0.0.33"
 clear_loss "$N3" v4
 clear_loss "$N3" v5
@@ -288,7 +295,7 @@ clear_loss "$N2" v3
 clear_loss "$N2" v2
 clear_loss "$N1" v1
 
-echo "== hot-reload and delete on n5 =="
+echo "== reload and delete on n5 =="
 cat > "$TMP/n5.toml.d/reload.toml" <<'CONFIG'
 [[records]]
 name = "scale-reload.namae."
@@ -296,8 +303,10 @@ type = "A"
 value = "10.0.0.55"
 publish = true
 CONFIG
+reload_node 5
 wait_for "$N1" "scale-reload.namae." "10.0.0.55"
 rm "$TMP/n5.toml.d/reload.toml"
+reload_node 5
 wait_gone "$N1" "scale-reload.namae."
 
 echo "PASS: netns scale (6-node ring + chord, split-brain, offline/restart, loss, reload)"

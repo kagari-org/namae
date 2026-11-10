@@ -134,6 +134,10 @@ start_all() {
     done
 }
 
+reload_node() {
+    "$BIN" ctl --socket "$TMP/n$1.sock" reload >/dev/null
+}
+
 resolve() {
     local ns=$1 name=$2
     ip netns exec "$ns" "$DIG" @127.0.0.1 -p 15353 +short +time=1 +tries=1 "$name" A 2>/dev/null || true
@@ -221,7 +225,7 @@ for i in $(seq 1 12); do
     ip -n "$N1" route add 10.200.0.2/32 proto bird dev v1
     ip -n "$N2" route add 10.200.0.1/32 proto bird dev v2
 
-    # Unique hot-reloaded name, then delete it.
+    # Unique dynamically reloaded name, then delete it.
     cat > "$TMP/n3.toml.d/churn.toml" <<CONFIG
 [[records]]
 name = "churn-$i.namae."
@@ -229,8 +233,10 @@ type = "A"
 value = "10.0.0.9"
 publish = true
 CONFIG
+    reload_node 3
     wait_for "$N1" "churn-$i.namae." "10.0.0.9"
     rm "$TMP/n3.toml.d/churn.toml"
+    reload_node 3
     wait_gone "$N1" "churn-$i.namae."
 done
 

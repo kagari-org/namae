@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -12,7 +11,6 @@ use std::{
 use tokio::{
     signal::unix::{SignalKind, signal},
     sync::{RwLock, mpsc},
-    time::Duration,
 };
 use tracing::{error, info, warn};
 
@@ -26,6 +24,8 @@ use crate::{
 };
 
 pub async fn run(config_path: PathBuf, config_dir: PathBuf, ctl_path: PathBuf) -> Result<()> {
+    fs::create_dir_all(&config_dir)
+        .with_context(|| format!("creating {}", config_dir.display()))?;
     let loaded = Arc::new(
         LoadedConfig::load(&config_path, &config_dir)
             .with_context(|| format!("loading {}", config_path.display()))?,
@@ -104,14 +104,6 @@ pub async fn run(config_path: PathBuf, config_dir: PathBuf, ctl_path: PathBuf) -
         })
     };
 
-    let (watch_tx, mut watch_rx) = mpsc::channel(16);
-    let _watcher = build_watcher(
-        watch_tx,
-        &config_path,
-        &config_dir,
-        loaded.raw.secret_file.as_deref(),
-    )?;
-
     let mut sighup = signal(SignalKind::hangup()).context("SIGHUP")?;
     let mut sigterm = signal(SignalKind::terminate()).context("SIGTERM")?;
     let ctrl_c = tokio::signal::ctrl_c();
@@ -135,13 +127,6 @@ pub async fn run(config_path: PathBuf, config_dir: PathBuf, ctl_path: PathBuf) -
                 }
             }
             Some(()) = reload_rx.recv() => {
-                if let Err(error) = reload(&config_path, &config_dir, &config, &store, &interfaces, &dns, &gossip).await {
-                    warn!("reload failed: {error:#}");
-                }
-            }
-            Some(()) = watch_rx.recv() => {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                while watch_rx.try_recv().is_ok() {}
                 if let Err(error) = reload(&config_path, &config_dir, &config, &store, &interfaces, &dns, &gossip).await {
                     warn!("reload failed: {error:#}");
                 }
@@ -175,57 +160,6 @@ pub async fn run(config_path: PathBuf, config_dir: PathBuf, ctl_path: PathBuf) -
     dns_changes.abort();
     control_task.abort();
     result
-}
-
-fn build_watcher(
-    tx: mpsc::Sender<()>,
-    config_path: &Path,
-    config_dir: &Path,
-    secret_file: Option<&Path>,
-) -> Result<RecommendedWatcher> {
-    fs::create_dir_all(config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
-    let config_path = config_path
-        .canonicalize()
-        .unwrap_or_else(|_| config_path.to_path_buf());
-    let config_dir = config_dir
-        .canonicalize()
-        .unwrap_or_else(|_| config_dir.to_path_buf());
-    let secret_file =
-        secret_file.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
-
-    let mut paths = HashSet::new();
-    if let Some(parent) = config_path.parent() {
-        paths.insert(parent.to_path_buf());
-    }
-    paths.insert(config_dir.clone());
-    if let Some(parent) = secret_file.as_deref().and_then(Path::parent) {
-        paths.insert(parent.to_path_buf());
-    }
-
-    let filter_config = config_path.clone();
-    let filter_dir = config_dir.clone();
-    let filter_secret = secret_file.clone();
-    let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-        let Ok(event) = result else {
-            return;
-        };
-        let relevant = event.paths.iter().any(|path| {
-            path == &filter_config
-                || path.starts_with(&filter_dir)
-                || filter_secret.as_ref().is_some_and(|secret| path == secret)
-        });
-        if relevant {
-            let _ = tx.try_send(());
-        }
-    })
-    .context("creating config watcher")?;
-
-    for path in paths {
-        watcher
-            .watch(&path, RecursiveMode::NonRecursive)
-            .with_context(|| format!("watching {}", path.display()))?;
-    }
-    Ok(watcher)
 }
 
 async fn reload(

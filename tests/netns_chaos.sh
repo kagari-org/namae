@@ -161,6 +161,10 @@ for n in 1 2 3 4; do
     [ -S "$TMP/n$n.sock" ] || fail "node n$n did not start"
 done
 
+reload_node() {
+    "$BIN" ctl --socket "$TMP/n$1.sock" reload >/dev/null
+}
+
 resolve() {
     local ns=$1 name=$2
     ip netns exec "$ns" "$DIG" @127.0.0.1 -p 15353 +short +time=1 +tries=1 "$name" A 2>/dev/null || true
@@ -235,6 +239,7 @@ type = "A"
 value = "10.0.0.9"
 publish = true
 CONFIG
+reload_node 3
 wait_for "$N1" "loss.namae." "10.0.0.9"
 clear_loss "$N1" v1
 clear_loss "$N2" v2
