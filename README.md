@@ -145,6 +145,7 @@ Peers authenticate with HMAC-SHA256 and exchange state over TCP. Each node has a
 - Changes are sent as `Delta` messages and forwarded with a hop limit.
 - Periodic `Heartbeat` messages refresh a peer's lease and carry a digest of its records.
 - `Digest` messages provide anti-entropy, repairing missed updates with full snapshots.
+- Relayed snapshots repair records but do not refresh the origin's lease; only heartbeats, deltas, or direct origin snapshots do. Expired origins are remembered for `tombstone_ttl` so relayed snapshots cannot resurrect them.
 - Deletions are represented by tombstones.
 
 Records from different origins use a deterministic conflict rule: higher `priority`, then higher `version`, then lower owner ID. Local static records win locally.

@@ -107,6 +107,8 @@ magic "NM" | v u8 | kind u8 | seq u64 | len u32 | body | mac[32]
 - Only a strictly newer `seq` refreshes `last_seen`; duplicate or old heartbeats do not.
 - A digest mismatch causes the receiver to request a snapshot from the sender.
 - If no update arrives within `origin_timeout`, the origin's records expire.
+- Only heartbeats, deltas, and direct snapshots from the origin refresh its lease. Relayed snapshots repair state without extending the lease, and expired origins are remembered for `tombstone_ttl` to prevent relayed snapshots from reviving them.
+- A relayed snapshot with a different session is rejected; a new session must be established by a heartbeat or a direct origin snapshot first.
 
 ### Digest
 

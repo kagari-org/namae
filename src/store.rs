@@ -170,6 +170,7 @@ pub struct Store {
     tombstones: HashMap<(NodeId, Name), (u64, Instant)>,
     remote_digests: HashMap<NodeId, [u8; 16]>,
     versions: HashMap<Name, VersionMeta>,
+    expired: HashMap<NodeId, Instant>,
 }
 
 impl Store {
@@ -185,6 +186,7 @@ impl Store {
             tombstones: HashMap::new(),
             remote_digests: HashMap::new(),
             versions: HashMap::new(),
+            expired: HashMap::new(),
         }
     }
 
@@ -362,10 +364,25 @@ impl Store {
         entries: Vec<(Name, NameEntry)>,
         tombstones: Vec<(Name, u64)>,
     ) -> ApplyResult {
+        self.apply_snapshot_from(origin, session, seq, entries, tombstones, true)
+    }
+
+    pub fn apply_snapshot_from(
+        &mut self,
+        origin: NodeId,
+        session: u64,
+        seq: u64,
+        entries: Vec<(Name, NameEntry)>,
+        tombstones: Vec<(Name, u64)>,
+        from_origin: bool,
+    ) -> ApplyResult {
         if let Some(meta) = self.meta.get(&origin)
             && meta.session == session
             && seq < meta.seq
         {
+            return ApplyResult::Stale;
+        }
+        if !from_origin && self.expired.contains_key(&origin) {
             return ApplyResult::Stale;
         }
         let mut changed = false;
@@ -373,6 +390,19 @@ impl Store {
             .meta
             .get(&origin)
             .is_none_or(|meta| meta.session != session);
+        if session_changed && !from_origin && self.meta.contains_key(&origin) {
+            return ApplyResult::Stale;
+        }
+        let last_seen = if from_origin {
+            Instant::now()
+        } else {
+            self.meta
+                .get(&origin)
+                .map_or_else(Instant::now, |meta| meta.last_seen)
+        };
+        if from_origin {
+            self.expired.remove(&origin);
+        }
         if session_changed {
             self.remote.remove(&origin);
             self.tombstones.retain(|(owner, _), _| *owner != origin);
@@ -412,7 +442,7 @@ impl Store {
             OriginMeta {
                 session,
                 seq,
-                last_seen: Instant::now(),
+                last_seen,
             },
         );
         ApplyResult::Applied { changed }
@@ -439,6 +469,7 @@ impl Store {
             return ApplyResult::Gap;
         }
         let mut changed = false;
+        self.expired.remove(&origin);
         let target = self.remote.entry(origin).or_default();
         for (name, entry) in upserts {
             if !self.zone.zone_of(&name) {
@@ -515,6 +546,9 @@ impl Store {
                 }
             }
         };
+        if updated {
+            self.expired.remove(&origin);
+        }
         let needs_sync = self
             .remote_digests
             .get(&origin)
@@ -561,6 +595,10 @@ impl Store {
         Some((meta.session, meta.seq, entries, tombstones))
     }
 
+    pub fn is_expired(&self, origin: NodeId) -> bool {
+        self.expired.contains_key(&origin)
+    }
+
     pub fn remote_entry(&self, origin: NodeId, name: &Name) -> Option<&NameEntry> {
         self.remote.get(&origin)?.get(name)
     }
@@ -580,12 +618,17 @@ impl Store {
             if self.remote.remove(&origin).is_some() {
                 changed = true;
             }
+            self.expired.insert(origin, now);
         }
         self.tombstones.retain(|_, (_, seen)| {
             let keep = now.duration_since(*seen) <= tombstone_ttl;
             changed |= !keep;
             keep
         });
+        let dead_ttl = tombstone_ttl.max(origin_timeout);
+        self.expired
+            .retain(|_, seen| now.duration_since(*seen) <= dead_ttl);
+
         let local = &self.local;
         self.versions.retain(|name, meta| {
             local.contains_key(name) || now.duration_since(meta.last_used) <= tombstone_ttl
@@ -889,6 +932,115 @@ mod tests {
         assert!(store.resolve(&name).is_some());
         let (_, _, _, tombstones) = store.snapshot_for(2).unwrap();
         assert!(!tombstones.iter().any(|(tombstone, _)| tombstone == &name));
+    }
+
+    #[test]
+    fn relayed_snapshot_does_not_revive_expired_origin() {
+        let mut store = Store::new(zone(), 1, 1);
+        let name = Name::from_str("a.namae.").unwrap();
+        store
+            .apply_snapshot(
+                2,
+                1,
+                1,
+                vec![(name.clone(), entry(2, 1, "10.0.0.2"))],
+                vec![],
+            )
+            .is_applied();
+        std::thread::sleep(Duration::from_millis(5));
+        store.expire(Duration::from_millis(1), Duration::from_secs(30));
+        assert!(store.resolve(&name).is_none());
+        let result = store.apply_snapshot_from(
+            2,
+            1,
+            2,
+            vec![(name.clone(), entry(2, 1, "10.0.0.2"))],
+            vec![],
+            false,
+        );
+        assert!(matches!(result, ApplyResult::Stale));
+        assert!(store.resolve(&name).is_none());
+        store
+            .apply_snapshot_from(
+                2,
+                1,
+                3,
+                vec![(name.clone(), entry(2, 1, "10.0.0.2"))],
+                vec![],
+                true,
+            )
+            .is_applied();
+        assert!(store.resolve(&name).is_some());
+    }
+
+    #[test]
+    fn stale_session_relayed_snapshot_is_ignored() {
+        let mut store = Store::new(zone(), 1, 1);
+        let name = Name::from_str("a.namae.").unwrap();
+        store
+            .apply_snapshot_from(
+                2,
+                1,
+                1,
+                vec![(name.clone(), entry(2, 1, "10.0.0.1"))],
+                vec![],
+                true,
+            )
+            .is_applied();
+        store
+            .apply_snapshot_from(
+                2,
+                2,
+                1,
+                vec![(name.clone(), entry(2, 1, "10.0.0.2"))],
+                vec![],
+                true,
+            )
+            .is_applied();
+        let result = store.apply_snapshot_from(
+            2,
+            1,
+            2,
+            vec![(name.clone(), entry(2, 1, "10.0.0.3"))],
+            vec![],
+            false,
+        );
+        assert!(matches!(result, ApplyResult::Stale));
+        assert_eq!(
+            store.resolve(&name).unwrap().records[0].data,
+            RecordData::A("10.0.0.2".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn new_owner_wins_after_old_origin_expires() {
+        let mut store = Store::new(zone(), 1, 1);
+        let name = Name::from_str("a.namae.").unwrap();
+        store
+            .apply_snapshot(
+                2,
+                1,
+                1,
+                vec![(name.clone(), entry(2, 5, "10.0.0.1"))],
+                vec![],
+            )
+            .is_applied();
+        std::thread::sleep(Duration::from_millis(5));
+        store.expire(Duration::from_millis(1), Duration::from_secs(30));
+        assert!(store.resolve(&name).is_none());
+        store
+            .apply_snapshot(
+                3,
+                1,
+                1,
+                vec![(name.clone(), entry(3, 1, "10.0.0.2"))],
+                vec![],
+            )
+            .is_applied();
+        assert_eq!(
+            store.resolve(&name).unwrap().records[0].data,
+            RecordData::A("10.0.0.2".parse().unwrap())
+        );
     }
 
     trait ApplyExt {

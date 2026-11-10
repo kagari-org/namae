@@ -4,7 +4,11 @@ set -euo pipefail
 if [ "${NAMAE_NETNS_INNER:-0}" != "1" ]; then
     exec env NAMAE_NETNS_INNER=1 unshare -Urnm bash -c '
         set -e
-        mount -t tmpfs tmpfs /run/netns
+        ipdir=$(dirname "$(readlink -f "$(command -v ip)")")
+        mount -t tmpfs tmpfs /run
+        mkdir -p /run/netns
+        PATH="$ipdir:$PATH"
+        export PATH
         exec "$@"
     ' _ "$0" "$@"
 fi

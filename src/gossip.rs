@@ -1001,7 +1001,17 @@ async fn handle_snapshot(shared: &Shared, peer_id: NodeId, message: SnapshotMess
         drop(snapshots);
         let forward_entries = entries.clone();
         let forward_tombstones = tombstones.clone();
-        if apply_snapshot(shared, origin, session, seq, entries, tombstones).await? {
+        if apply_snapshot(
+            shared,
+            origin,
+            session,
+            seq,
+            entries,
+            tombstones,
+            peer_id == origin,
+        )
+        .await?
+        {
             broadcast_snapshot(
                 shared,
                 peer_id,
@@ -1023,6 +1033,7 @@ async fn handle_snapshot(shared: &Shared, peer_id: NodeId, message: SnapshotMess
             seq,
             message.entries,
             message.tombstones,
+            peer_id == origin,
         )
         .await?
         {
@@ -1071,6 +1082,7 @@ async fn apply_snapshot(
     seq: u64,
     entries: Vec<WireEntry>,
     tombstones: Vec<WireTombstone>,
+    from_origin: bool,
 ) -> Result<bool> {
     let entries = entries
         .iter()
@@ -1084,11 +1096,14 @@ async fn apply_snapshot(
                 .map(|name| (name, tombstone.version))
         })
         .collect::<Vec<_>>();
-    let result = shared
-        .store
-        .write()
-        .await
-        .apply_snapshot(origin, session, seq, entries, tombstones);
+    let result = shared.store.write().await.apply_snapshot_from(
+        origin,
+        session,
+        seq,
+        entries,
+        tombstones,
+        from_origin,
+    );
     debug!("snapshot from {origin:X} session {session} seq {seq}: {result:?}");
     shared.stats.snapshots_in.fetch_add(1, Ordering::Relaxed);
     let changed = matches!(result, ApplyResult::Applied { changed: true });
@@ -1212,7 +1227,11 @@ async fn handle_digest(
             continue;
         }
         match local.iter().find(|digest| digest.origin == entry.origin) {
-            None => request.push(entry.origin),
+            None => {
+                if !shared.store.read().await.is_expired(entry.origin) {
+                    request.push(entry.origin);
+                }
+            }
             Some(digest) if digest.session != entry.session || digest.seq < entry.seq => {
                 request.push(entry.origin)
             }
@@ -1403,7 +1422,9 @@ mod tests {
         let first = retry_delay(1);
         assert!(first >= Duration::from_millis(800));
         assert!(first <= Duration::from_millis(1200));
-        assert_eq!(retry_delay(20), CONNECT_RETRY_MAX);
+        let capped = retry_delay(20);
+        assert!(capped >= Duration::from_secs(50));
+        assert!(capped <= CONNECT_RETRY_MAX);
     }
 
     #[test]

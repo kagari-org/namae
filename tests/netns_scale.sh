@@ -4,7 +4,11 @@ set -euo pipefail
 if [ "${NAMAE_NETNS_INNER:-0}" != "1" ]; then
     exec env NAMAE_NETNS_INNER=1 unshare -Urnm bash -c '
         set -e
-        mount -t tmpfs tmpfs /run/netns
+        ipdir=$(dirname "$(readlink -f "$(command -v ip)")")
+        mount -t tmpfs tmpfs /run
+        mkdir -p /run/netns
+        PATH="$ipdir:$PATH"
+        export PATH
         exec "$@"
     ' _ "$0" "$@"
 fi
@@ -13,6 +17,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${NAMAE_BIN:-$ROOT/target/debug/namae}
 DIG=${DIG:-$(command -v dig || true)}
 TC=${TC:-$(command -v tc || true)}
+[ -x "$TC" ] || TC=$(command -v tc)
 TMP=$(mktemp -d "$ROOT/target/namae-scale.XXXXXX")
 N1="namae-scale-$$-1"
 N2="namae-scale-$$-2"
