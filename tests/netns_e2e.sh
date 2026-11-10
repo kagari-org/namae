@@ -5,6 +5,10 @@ if [ "${NAMAE_NETNS_INNER:-0}" != "1" ]; then
     exec env NAMAE_NETNS_INNER=1 unshare -Urnm bash -c '
         set -e
         ipdir=$(dirname "$(readlink -f "$(command -v ip)")")
+        resolv=$(mktemp /tmp/namae-resolv.XXXXXX)
+        printf "nameserver 127.0.0.1\n" > "$resolv"
+        mount --bind "$resolv" /etc/resolv.conf
+        rm -f "$resolv"
         mount -t tmpfs tmpfs /run
         mkdir -p /run/netns
         PATH="$ipdir:$PATH"

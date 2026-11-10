@@ -136,7 +136,7 @@ At startup, `namae` dumps the routing table and subscribes to netlink route upda
 - it is a unicast route in the main table;
 - it is an IPv4 `/32` or an IPv6 `/128`.
 
-The destination address becomes the peer address; for IPv6, `RTA_OIF` supplies the scope ID. Manual `seeds` are always merged in, and local addresses are excluded. Route monitoring is required; if netlink monitor is unavailable, `namae` exits instead of silently falling back to polling. Failed connection attempts use exponential backoff from 1 second to 60 seconds with jitter, so routes that do not run `namae` are probed only occasionally; a successful connection resets the backoff.
+The destination address becomes the peer address; for IPv6, `RTA_OIF` supplies the scope ID. The snapshot queries IPv4 and IPv6 separately and only accepts routes from the main table (254). Manual `seeds` are always merged in, and local addresses are excluded. If the same node is reachable through multiple addresses, only one gossip connection is kept: IPv4 is preferred across families, and within a family the connection with the lower canonical endpoint pair wins. Route monitoring is required; if netlink monitor is unavailable, `namae` exits instead of silently falling back to polling. Failed connection attempts use exponential backoff from 1 second to 60 seconds with jitter, so routes that do not run `namae` are probed only occasionally; a successful connection resets the backoff.
 
 ### Gossip
 
@@ -221,10 +221,12 @@ DIG=$(command -v dig) ./tests/netns_e2e.sh
 DIG=$(command -v dig) TC=$(command -v tc) ./tests/netns_chaos.sh
 DIG=$(command -v dig) TC=$(command -v tc) ./tests/netns_scale.sh
 DIG=$(command -v dig) ./tests/netns_mem.sh
+DIG=$(command -v dig) ./tests/netns_ipv6.sh
+DIG=$(command -v dig) ./tests/netns_dualstack.sh
 ./tests/netns_backoff.sh
 ```
 
-`netns_e2e.sh` covers a three-node partial mesh, PTR, and route flap. `netns_chaos.sh` covers a four-node ring, partition and heal, 10% packet loss on both links of a node, node offline record expiry, and restart/resync. `netns_scale.sh` covers a six-node ring with a chord, split-brain partition, node loss/restart, packet loss on both links of a node, explicit reload, and delete propagation. `netns_mem.sh` repeatedly restarts nodes, flaps routes, and explicitly reloads unique records while checking RSS, thread count, and file descriptors. `netns_backoff.sh` verifies that a route without `namae` is retried with increasing delays and stops retrying when the route is removed.
+`netns_e2e.sh` covers a three-node partial mesh, PTR, and route flap. `netns_chaos.sh` covers a four-node ring, partition and heal, 10% packet loss on both links of a node, node offline record expiry, and restart/resync. `netns_scale.sh` covers a six-node ring with a chord, split-brain partition, node loss/restart, packet loss on both links of a node, explicit reload, and delete propagation. `netns_mem.sh` repeatedly restarts nodes, flaps routes, and explicitly reloads unique records while checking RSS, thread count, and file descriptors. `netns_backoff.sh` verifies that a route without `namae` is retried with increasing delays and stops retrying when the route is removed. `netns_ipv6.sh` verifies IPv6 `/128` route discovery and gossip over a veth pair. `netns_dualstack.sh` verifies that a node reachable over multiple IPv4 and IPv6 addresses keeps a single stable gossip connection, preferring IPv4 and then a deterministic endpoint key.
 
 ## Documentation
 

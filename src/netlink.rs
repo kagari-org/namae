@@ -11,7 +11,7 @@ use rtnetlink::{
     packet_route::{
         AddressFamily, RouteNetlinkMessage,
         address::{AddressAttribute, AddressMessage},
-        route::{RouteAddress, RouteAttribute, RouteMessage, RouteType},
+        route::{RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteType},
     },
 };
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -44,13 +44,19 @@ pub async fn snapshot(proto: Proto, port: u16) -> Result<Snapshot> {
     let (connection, handle, _messages) = rtnetlink::new_connection().context("netlink route")?;
     let connection = tokio::spawn(connection);
 
-    let routes = handle
-        .route()
-        .get(RouteMessage::default())
-        .execute()
-        .try_collect::<Vec<_>>()
-        .await
-        .context("dumping routes")?;
+    let mut routes = Vec::new();
+    for family in [AddressFamily::Inet, AddressFamily::Inet6] {
+        let mut request = RouteMessage::default();
+        request.header.address_family = family;
+        let batch = handle
+            .route()
+            .get(request)
+            .execute()
+            .try_collect::<Vec<_>>()
+            .await
+            .context("dumping routes")?;
+        routes.extend(batch);
+    }
     let addresses = handle
         .address()
         .get()
@@ -132,6 +138,9 @@ pub fn monitor(
 }
 
 fn route_to_peer(route: &RouteMessage, proto: Proto, port: u16) -> Option<Peer> {
+    if route.header.table != RouteHeader::RT_TABLE_MAIN {
+        return None;
+    }
     if route.header.kind != RouteType::Unicast {
         return None;
     }
@@ -276,6 +285,7 @@ mod tests {
             destination_prefix_length: prefix,
             protocol,
             kind: RouteType::Unicast,
+            table: RouteHeader::RT_TABLE_MAIN,
             ..Default::default()
         };
         let mut message = RouteMessage::default();
@@ -284,6 +294,13 @@ mod tests {
             ip.parse::<std::net::Ipv4Addr>().unwrap(),
         ))];
         message
+    }
+
+    #[test]
+    fn ignores_non_main_tables() {
+        let mut message = route(32, RouteProtocol::Bird, "10.0.0.1");
+        message.header.table = 100;
+        assert!(route_to_peer(&message, Proto(Some(12)), 7654).is_none());
     }
 
     #[test]

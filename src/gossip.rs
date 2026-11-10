@@ -137,10 +137,28 @@ pub struct PeerInfo {
     pub addr: SocketAddr,
     pub conn_id: u64,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ConnectionKey(SocketAddr, SocketAddr);
+
+impl ConnectionKey {
+    fn new(a: SocketAddr, b: SocketAddr) -> Self {
+        if a <= b { Self(a, b) } else { Self(b, a) }
+    }
+}
+
+struct PeerConnection {
+    peer_id: NodeId,
+    peer_port: u16,
+    addr: SocketAddr,
+    local_addr: SocketAddr,
+    initiator: bool,
+    connected_tx: Option<mpsc::Sender<ConnectEvent>>,
+}
 
 struct PeerSender {
     conn_id: u64,
     addr: SocketAddr,
+    key: ConnectionKey,
     tx: mpsc::Sender<Frame>,
     shutdown: watch::Sender<bool>,
 }
@@ -400,6 +418,7 @@ fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
 async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) -> Result<()> {
     loop {
         let (stream, addr) = listener.accept().await.context("accepting peer")?;
+        let local_addr = stream.local_addr().context("local address")?;
         let _ = stream.set_nodelay(true);
         let shared = shared.clone();
         tokio::spawn(async move {
@@ -414,11 +433,14 @@ async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) -> Result<()> {
                     if let Err(error) = run_peer(
                         shared,
                         stream,
-                        peer.node_id,
-                        peer.listen_port,
-                        addr,
-                        false,
-                        None,
+                        PeerConnection {
+                            peer_id: peer.node_id,
+                            peer_port: peer.listen_port,
+                            addr,
+                            local_addr,
+                            initiator: false,
+                            connected_tx: None,
+                        },
                     )
                     .await
                     {
@@ -574,6 +596,7 @@ async fn connect_peer(
         .context("connect timeout")?
         .context("connect")?;
     let _ = stream.set_nodelay(true);
+    let local_addr = stream.local_addr().context("local address")?;
     let secret = shared.secret.load_full();
     let (stream, peer) = timeout(
         Duration::from_secs(5),
@@ -584,24 +607,30 @@ async fn connect_peer(
     run_peer(
         shared,
         stream,
-        peer.node_id,
-        peer.listen_port,
-        addr,
-        true,
-        Some(events),
+        PeerConnection {
+            peer_id: peer.node_id,
+            peer_port: peer.listen_port,
+            addr,
+            local_addr,
+            initiator: true,
+            connected_tx: Some(events),
+        },
     )
     .await
 }
-
 async fn run_peer(
     shared: Arc<Shared>,
     stream: SecureStream<TcpStream>,
-    peer_id: NodeId,
-    peer_port: u16,
-    addr: SocketAddr,
-    initiator: bool,
-    connected_tx: Option<mpsc::Sender<ConnectEvent>>,
+    connection: PeerConnection,
 ) -> Result<()> {
+    let PeerConnection {
+        peer_id,
+        peer_port,
+        addr,
+        local_addr,
+        initiator,
+        connected_tx,
+    } = connection;
     if peer_id == shared.local_id {
         return Ok(());
     }
@@ -610,6 +639,7 @@ async fn run_peer(
     } else {
         with_port(addr, peer_port)
     };
+    let key = ConnectionKey::new(local_addr, addr);
     let preferred = initiator == (shared.local_id < peer_id);
     if !preferred {
         if !initiator {
@@ -629,15 +659,27 @@ async fn run_peer(
         if existing_closed {
             peers.remove(&peer_id);
         }
-        if peers.contains_key(&peer_id) {
-            debug!("duplicate connection for node {peer_id:X}; closing {peer_addr}");
-            return Ok(());
+        if let Some(existing) = peers.get(&peer_id) {
+            let existing_ipv4 = existing.addr.is_ipv4();
+            let new_ipv4 = peer_addr.is_ipv4();
+            let keep_existing = if existing_ipv4 != new_ipv4 {
+                existing_ipv4
+            } else {
+                existing.key < key
+            };
+            if keep_existing {
+                debug!("duplicate connection for node {peer_id:X}; closing {peer_addr}");
+                return Ok(());
+            }
+            let _ = existing.shutdown.send(true);
+            peers.remove(&peer_id);
         }
         peers.insert(
             peer_id,
             PeerSender {
                 conn_id,
                 addr: peer_addr,
+                key,
                 tx: tx.clone(),
                 shutdown: shutdown_tx,
             },
@@ -1415,6 +1457,13 @@ mod tests {
                 data: RecordData::A(ip.parse().unwrap()),
             }],
         }
+    }
+
+    #[test]
+    fn connection_key_is_symmetric() {
+        let a: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        assert_eq!(ConnectionKey::new(a, b), ConnectionKey::new(b, a));
     }
 
     #[test]
