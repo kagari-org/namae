@@ -44,8 +44,8 @@ A full mesh is not required:
 
 - Authoritative answers only; no recursion or forwarding.
 - Queries outside the zone return `REFUSED`.
-- A process has one forward `zone`; `reverse_zones` are auxiliary and do not add a second forward zone.
-- A/AAAA records are also synthesized as PTR records under matching reverse zones. CNAME chains, ANY, wildcards, and SOA negative TTL are supported.
+- A process has one forward `zone`. Reverse authorities cover the whole `in-addr.arpa.` and `ip6.arpa.` trees.
+- A/AAAA records with `rdns = true` are also synthesized as PTR records. CNAME chains, ANY, wildcards, and SOA negative TTL are supported.
 - No systemd-resolved, NSS, or resolv.conf integration; that is left to the operator.
 
 ### Security
@@ -70,4 +70,4 @@ A full mesh is not required:
 - Invalid configuration: startup fails; reload keeps the previous configuration.
 - Gossip handshake failure: close the connection, count it, retry later.
 - No heartbeat from a peer for too long: the origin's records expire.
-- Changes to `zone`, `dns_listen`, `reverse_zones`, `port`, or `id`: reload rejects the change or asks for a restart.
+- Changes to `zone`, `dns_listen`, `port`, or `id`: reload rejects the change or asks for a restart.

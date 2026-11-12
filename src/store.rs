@@ -63,6 +63,7 @@ pub struct NameEntry {
     pub priority: u16,
     pub version: u64,
     pub ttl: u32,
+    pub rdns: bool,
     pub records: Vec<RrData>,
 }
 
@@ -94,6 +95,7 @@ pub struct ResolvedRecord {
     pub ttl: Option<u32>,
     pub priority: u16,
     pub publish: bool,
+    pub rdns: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -225,7 +227,7 @@ impl Store {
         interfaces: &HashMap<String, Vec<IpAddr>>,
         default_ttl: u32,
     ) -> Result<LocalDiff> {
-        let mut grouped: BTreeMap<Name, (Vec<RrData>, u32, u16, bool)> = BTreeMap::new();
+        let mut grouped: BTreeMap<Name, (Vec<RrData>, u32, u16, bool, bool)> = BTreeMap::new();
         for record in records {
             let (ttl, priority, publish) = (
                 record.ttl.unwrap_or(default_ttl).clamp(5, 3600),
@@ -234,8 +236,8 @@ impl Store {
             );
             let slot = grouped
                 .entry(record.name.clone())
-                .or_insert_with(|| (Vec::new(), ttl, priority, publish));
-            if slot.2 != priority || slot.3 != publish {
+                .or_insert_with(|| (Vec::new(), ttl, priority, publish, record.rdns));
+            if slot.2 != priority || slot.3 != publish || slot.4 != record.rdns {
                 bail!("inconsistent record options for {}", record.name);
             }
             slot.1 = slot.1.min(ttl);
@@ -260,7 +262,7 @@ impl Store {
             }
         }
 
-        for (records, _, _, _) in grouped.values_mut() {
+        for (records, _, _, _, _) in grouped.values_mut() {
             records.sort_by(|a, b| {
                 a.rtype
                     .cmp(&b.rtype)
@@ -271,7 +273,7 @@ impl Store {
 
         let mut diff = LocalDiff::default();
         let mut next_local: BTreeMap<Name, LocalEntry> = BTreeMap::new();
-        for (name, (records, ttl, priority, publish)) in grouped {
+        for (name, (records, ttl, priority, publish, rdns)) in grouped {
             let now = Instant::now();
             let meta = self.versions.entry(name.clone()).or_insert(VersionMeta {
                 version: 0,
@@ -283,6 +285,7 @@ impl Store {
                 priority,
                 version: meta.version,
                 ttl,
+                rdns,
                 records,
             };
             entry.sort_records();
@@ -292,6 +295,7 @@ impl Store {
                     || previous.entry.ttl != entry.ttl
                     || previous.entry.priority != entry.priority
                     || previous.publish != publish
+                    || previous.entry.rdns != rdns
             });
             if previous.is_none() || changed {
                 meta.version = meta.version.wrapping_add(1);
@@ -738,6 +742,7 @@ mod tests {
             priority: 100,
             version,
             ttl: 60,
+            rdns: true,
             records: vec![RrData {
                 rtype: RecordType::A,
                 data: RecordData::A(ip.parse().unwrap()),
@@ -765,6 +770,7 @@ mod tests {
             ttl: Some(60),
             priority: 100,
             publish: false,
+            rdns: true,
         }];
         store
             .set_local_records(&records, &HashMap::new(), 60)
@@ -870,6 +876,7 @@ mod tests {
                         ttl: Some(60),
                         priority: 100,
                         publish: true,
+                        rdns: true,
                     }],
                     &HashMap::new(),
                     60,
@@ -885,6 +892,7 @@ mod tests {
                     ttl: Some(60),
                     priority: 100,
                     publish: true,
+                    rdns: true,
                 }],
                 &HashMap::new(),
                 60,

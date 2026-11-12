@@ -95,8 +95,6 @@ where
 pub struct Config {
     pub id: Option<u64>,
     pub zone: String,
-    #[serde(default)]
-    pub reverse_zones: Vec<String>,
     #[serde(default = "default_dns_listen")]
     pub dns_listen: Vec<SocketAddr>,
     #[serde(default = "default_port")]
@@ -159,12 +157,19 @@ pub struct RecordSpec {
     pub priority: u16,
     #[serde(default = "default_publish")]
     pub publish: bool,
+    #[serde(default = "default_rdns")]
+    pub rdns: bool,
 }
 
 fn default_priority() -> u16 {
     100
 }
+
 fn default_publish() -> bool {
+    true
+}
+
+fn default_rdns() -> bool {
     true
 }
 
@@ -179,7 +184,6 @@ struct Dropin {
 pub struct LoadedConfig {
     pub raw: Config,
     pub zone: Name,
-    pub reverse_zones: Vec<Name>,
     pub secret: Vec<u8>,
     pub records: Vec<ResolvedRecord>,
     pub node_id: u64,
@@ -221,16 +225,6 @@ impl LoadedConfig {
         }
 
         let zone = normalize_zone(&raw.zone)?;
-        let reverse_zones = raw
-            .reverse_zones
-            .iter()
-            .map(|zone| normalize_zone(zone))
-            .collect::<Result<Vec<_>>>()?;
-        for reverse in &reverse_zones {
-            if *reverse == zone || !is_reverse_zone(reverse) {
-                bail!("invalid reverse zone {reverse}");
-            }
-        }
         let secret = resolve_secret(&raw)?;
         let records = resolve_records(&zone, &specs)?;
         validate_records(&records)?;
@@ -238,7 +232,6 @@ impl LoadedConfig {
             node_id: raw.id.unwrap_or_else(rand::random),
             raw,
             zone,
-            reverse_zones,
             secret,
             records,
         })
@@ -282,11 +275,6 @@ pub fn normalize_zone(input: &str) -> Result<Name> {
     }
     Ok(name.to_lowercase())
 }
-fn is_reverse_zone(zone: &Name) -> bool {
-    let name = zone.to_string();
-    name.ends_with("in-addr.arpa.") || name.ends_with("ip6.arpa.")
-}
-
 pub fn normalize_name(input: &str, zone: &Name) -> Result<Name> {
     let input = input.trim();
     if input.is_empty() {
@@ -374,6 +362,7 @@ fn resolve_records(zone: &Name, specs: &[RecordSpec]) -> Result<Vec<ResolvedReco
             ttl: spec.ttl,
             priority: spec.priority,
             publish: spec.publish,
+            rdns: spec.rdns,
         });
     }
     Ok(records)
@@ -381,12 +370,13 @@ fn resolve_records(zone: &Name, specs: &[RecordSpec]) -> Result<Vec<ResolvedReco
 
 fn validate_records(records: &[ResolvedRecord]) -> Result<()> {
     use std::collections::HashMap;
-    let mut by_name: HashMap<&Name, (bool, u16)> = HashMap::new();
+    let mut by_name: HashMap<&Name, (bool, u16, bool)> = HashMap::new();
     let mut cname = HashMap::new();
     for record in records {
-        let entry = by_name
-            .entry(&record.name)
-            .or_insert((record.publish, record.priority));
+        let entry =
+            by_name
+                .entry(&record.name)
+                .or_insert((record.publish, record.priority, record.rdns));
         if entry.0 != record.publish {
             bail!(
                 "records for {} disagree on publish; use one value per name",
@@ -396,6 +386,12 @@ fn validate_records(records: &[ResolvedRecord]) -> Result<()> {
         if entry.1 != record.priority {
             bail!(
                 "records for {} disagree on priority; use one value per name",
+                record.name
+            );
+        }
+        if entry.2 != record.rdns {
+            bail!(
+                "records for {} disagree on rdns; use one value per name",
                 record.name
             );
         }
@@ -497,24 +493,24 @@ value = "fd00::1"
     }
 
     #[test]
-    fn reverse_zones_are_normalized_and_validated() {
+    fn rdns_defaults_to_true_and_must_agree_per_name() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("namae.toml");
         write(
             dir.path(),
             "namae.toml",
-            "zone = \"namae.\"\nsecret = \"test\"\nreverse_zones = [\"10.in-addr.arpa.\"]\n",
+            "zone = \"namae.\"\nsecret = \"test\"\n\n[[records]]\nname = \"a.namae.\"\ntype = \"A\"\nvalue = \"10.0.0.1\"\n\n[[records]]\nname = \"a.namae.\"\ntype = \"AAAA\"\nvalue = \"fd00::1\"\n",
         );
         let loaded = LoadedConfig::load(&main, &dir.path().join("d")).unwrap();
-        assert_eq!(loaded.reverse_zones[0].to_string(), "10.in-addr.arpa.");
+        assert!(loaded.records.iter().all(|record| record.rdns));
+
         write(
             dir.path(),
             "namae.toml",
-            "zone = \"namae.\"\nsecret = \"test\"\nreverse_zones = [\"example.com.\"]\n",
+            "zone = \"namae.\"\nsecret = \"test\"\n\n[[records]]\nname = \"a.namae.\"\ntype = \"A\"\nvalue = \"10.0.0.1\"\nrdns = false\n\n[[records]]\nname = \"a.namae.\"\ntype = \"AAAA\"\nvalue = \"fd00::1\"\n",
         );
         assert!(LoadedConfig::load(&main, &dir.path().join("d")).is_err());
     }
-
     #[test]
     fn wildcard_names_are_allowed() {
         let zone = normalize_zone("namae.").unwrap();

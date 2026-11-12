@@ -44,28 +44,21 @@ impl RequestHandler for DnsHandler {
 pub struct DnsService {
     catalog: Arc<ArcSwap<Catalog>>,
     zone: Name,
-    reverse_zones: Vec<Name>,
     negative_ttl: u32,
 }
 
 impl DnsService {
-    pub fn new(
-        zone: Name,
-        reverse_zones: Vec<Name>,
-        store: &Store,
-        negative_ttl: u32,
-    ) -> Result<Self> {
-        let catalog = build_catalog(&zone, &reverse_zones, store, negative_ttl)?;
+    pub fn new(zone: Name, store: &Store, negative_ttl: u32) -> Result<Self> {
+        let catalog = build_catalog(&zone, store, negative_ttl)?;
         Ok(Self {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             zone,
-            reverse_zones,
             negative_ttl,
         })
     }
 
     pub fn update(&self, store: &Store) -> Result<()> {
-        let catalog = build_catalog(&self.zone, &self.reverse_zones, store, self.negative_ttl)?;
+        let catalog = build_catalog(&self.zone, store, self.negative_ttl)?;
         self.catalog.store(Arc::new(catalog));
         Ok(())
     }
@@ -101,18 +94,13 @@ fn rdata(record: &RecordData) -> RData {
     }
 }
 
-fn build_catalog(
-    zone: &Name,
-    reverse_zones: &[Name],
-    store: &Store,
-    negative_ttl: u32,
-) -> Result<Catalog> {
+fn build_catalog(zone: &Name, store: &Store, negative_ttl: u32) -> Result<Catalog> {
     let mut authority = authority_for(zone, negative_ttl)?;
     let mut reverse = BTreeMap::new();
-    for zone in reverse_zones {
-        reverse.insert(zone.clone(), authority_for(zone, negative_ttl)?);
+    for origin in ["in-addr.arpa.", "ip6.arpa."] {
+        let origin = Name::from_str(origin).expect("static reverse zone");
+        reverse.insert(origin.clone(), authority_for(&origin, negative_ttl)?);
     }
-
     for (name, entry) in store.resolved_entries() {
         for rr in &entry.records {
             authority.upsert_mut(
@@ -122,6 +110,9 @@ fn build_catalog(
             let Some(address) = rr.data.address() else {
                 continue;
             };
+            if !entry.rdns {
+                continue;
+            }
             if name.to_string().starts_with("*.") {
                 continue;
             }
@@ -219,12 +210,13 @@ mod tests {
                     ttl: Some(60),
                     priority: 100,
                     publish: true,
+                    rdns: true,
                 }],
                 &HashMap::new(),
                 60,
             )
             .unwrap();
-        let service = Arc::new(DnsService::new(zone, Vec::new(), &store, 30).unwrap());
+        let service = Arc::new(DnsService::new(zone, &store, 30).unwrap());
         let addr: SocketAddr = "127.0.0.1:15354".parse().unwrap();
         let handle = tokio::spawn(async move { service.serve(&[addr]).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -273,20 +265,16 @@ mod semantics_tests {
             ttl: Some(60),
             priority: 100,
             publish: true,
+            rdns: true,
         }
     }
 
-    async fn start(
-        zone: Name,
-        reverse: Vec<Name>,
-        records: Vec<ResolvedRecord>,
-        port: u16,
-    ) -> JoinHandle<Result<()>> {
+    async fn start(zone: Name, records: Vec<ResolvedRecord>, port: u16) -> JoinHandle<Result<()>> {
         let mut store = Store::new(zone.clone(), 1, 1);
         store
             .set_local_records(&records, &HashMap::new(), 60)
             .unwrap();
-        let service = Arc::new(DnsService::new(zone, reverse, &store, 30).unwrap());
+        let service = Arc::new(DnsService::new(zone, &store, 30).unwrap());
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let handle = tokio::spawn(async move { service.serve(&[addr]).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -332,8 +320,8 @@ mod semantics_tests {
                 RecordData::A("10.0.0.9".parse().unwrap()),
             ),
         ];
-        let handle = start(zone.clone(), Vec::new(), records.clone(), 15356).await;
-        let without_wildcard = start(zone, Vec::new(), records[..2].to_vec(), 15358).await;
+        let handle = start(zone.clone(), records.clone(), 15356).await;
+        let without_wildcard = start(zone, records[..2].to_vec(), 15358).await;
 
         let response = ask(15356, "alias.namae.", RecordType::A).await;
         assert_eq!(response.response_code(), ResponseCode::NoError);
@@ -392,19 +380,29 @@ mod semantics_tests {
             RecordType::A,
             RecordData::A("10.0.0.1".parse().unwrap()),
         )];
-        let handle = start(
-            zone,
-            vec![Name::from_str("10.in-addr.arpa.").unwrap()],
-            records,
-            15357,
-        )
-        .await;
+        let handle = start(zone, records, 15357).await;
 
         let response = ask(15357, "1.0.0.10.in-addr.arpa.", RecordType::PTR).await;
         assert_eq!(response.response_code(), ResponseCode::NoError);
         assert!(response.answers().iter().any(|record| {
             matches!(record.data(), RData::PTR(ptr) if ptr.0.to_string() == "host.namae.")
         }));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn rdns_false_suppresses_ptr() {
+        let zone = Name::from_str("namae.").unwrap();
+        let mut address = record(
+            "host.namae.",
+            RecordType::A,
+            RecordData::A("10.0.0.1".parse().unwrap()),
+        );
+        address.rdns = false;
+        let handle = start(zone, vec![address], 15359).await;
+
+        let response = ask(15359, "1.0.0.10.in-addr.arpa.", RecordType::PTR).await;
+        assert_eq!(response.response_code(), ResponseCode::NXDomain);
         handle.abort();
     }
 

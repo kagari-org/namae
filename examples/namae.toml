@@ -1,5 +1,4 @@
 zone = "namae."
-# reverse_zones = ["10.in-addr.arpa."]
 dns_listen = ["127.0.0.1:15353"]
 port = 7654
 secret = "change-me"
@@ -14,6 +13,7 @@ value = "10.0.0.1"
 ttl = 300
 priority = 100
 publish = true
+rdns = true
 
 [[records]]
 name = "router.namae."

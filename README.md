@@ -45,7 +45,6 @@ Main configuration lives in `/etc/namae.toml`:
 
 ```toml
 zone = "namae."
-# reverse_zones = ["10.in-addr.arpa."]
 dns_listen = ["127.0.0.1:15353"]
 port = 7654
 secret = "change-me"
@@ -95,7 +94,6 @@ All options are top-level. `zone` is required.
 | Option | Default | Description |
 |---|---|---|
 | `zone` | required | Authoritative forward zone, e.g. `namae.` |
-| `reverse_zones` | `[]` | Auxiliary reverse zones for PTR, e.g. `["10.in-addr.arpa."]` |
 | `dns_listen` | `["127.0.0.1:15353"]` | DNS UDP/TCP listen addresses |
 | `port` | `7654` | Gossip listen/connect port |
 | `secret` / `secret_file` | at least one | Shared HMAC secret; mutually exclusive |
@@ -118,13 +116,15 @@ value = "10.0.0.1"        # mutually exclusive with from_interface
 ttl = 300                 # optional
 priority = 100            # optional; used for conflict resolution
 publish = true            # optional; default true
+rdns = true               # optional; default true
 ```
 
 - A single-label name is expanded under `zone`; dotted names are treated as FQDNs.
 - A leading `*.` creates a wildcard record (e.g. `*.namae.`).
 - `from_interface` is only valid for `A` and `AAAA`. It publishes every address of the matching family on that interface, skipping link-local, tentative, DADFAILED, and loopback addresses.
-- A name must use one `publish` value and one `priority` value across its records.
+- A name must use one `publish`, `priority`, and `rdns` value across its records.
 - `publish = false` keeps a record local; it is not gossiped.
+- `rdns = false` suppresses PTR generation for that name.
 
 ## How it works
 
@@ -152,13 +152,13 @@ Records from different origins use a deterministic conflict rule: higher `priori
 
 ### DNS
 
-`zone` is authoritative and served over UDP and TCP. `reverse_zones` add auxiliary reverse authorities for PTR lookups.
+`zone` is authoritative and served over UDP and TCP. `in-addr.arpa.` and `ip6.arpa.` are also served as catch-all reverse authorities.
 
 - Name exists, queried type does not: `NOERROR/NODATA` with SOA.
 - Name does not exist: `NXDOMAIN` with SOA.
 - Outside the zone: `REFUSED`.
 - `AXFR`, `IXFR`, and `NOTIFY`: `REFUSED`.
-- A/AAAA records are also published as PTR records under a matching configured `reverse_zones` entry.
+- A/AAAA records with `rdns = true` are also published as PTR records under `in-addr.arpa.` or `ip6.arpa.`.
 
 EDNS0, UDP truncation, and TCP fallback are handled by the DNS server.
 
@@ -183,7 +183,7 @@ The daemon does not watch files. After changing the main config, a drop-in, or `
 - Valid configuration is swapped atomically.
 - Invalid configuration is rejected and the previous one stays active.
 - Records, seeds, TTLs, and intervals reload without a restart.
-- Changing `zone`, `dns_listen`, `reverse_zones`, `port`, or `id` requires a restart.
+- Changing `zone`, `dns_listen`, `port`, or `id` requires a restart.
 - Changing the secret closes existing gossip connections and reconnects with the new key.
 
 ## Security model
@@ -202,7 +202,7 @@ This is appropriate for a small, trusted network. It is not a replacement for pe
 - No persistence: records, peers, and tombstones live in memory. A node with a random `id` gets a new origin after restart; old records expire after `origin_timeout`.
 - No L2, broadcast, or multicast discovery.
 - No recursive resolution or forwarding.
-- One forward `zone` per process; `reverse_zones` are auxiliary and do not add a second forward zone.
+- One forward `zone` per process. Reverse authorities cover the whole `in-addr.arpa.` and `ip6.arpa.` trees.
 - No DNSSEC.
 
 ## Development

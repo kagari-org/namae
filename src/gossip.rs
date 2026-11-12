@@ -60,12 +60,18 @@ struct WireRecord {
     value: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WireEntry {
     name: String,
     priority: u16,
     version: u64,
     ttl: u32,
+    #[serde(default = "default_true")]
+    rdns: bool,
     records: Vec<WireRecord>,
 }
 
@@ -1381,6 +1387,7 @@ fn wire_entry(name: &Name, entry: &NameEntry, _zone: &Name) -> WireEntry {
         priority: entry.priority,
         version: entry.version,
         ttl: entry.ttl,
+        rdns: entry.rdns,
         records: entry
             .records
             .iter()
@@ -1426,6 +1433,7 @@ fn entry_from_wire(zone: &Name, owner: NodeId, entry: &WireEntry) -> Option<(Nam
             priority: entry.priority,
             version: entry.version,
             ttl: entry.ttl.clamp(5, 3600),
+            rdns: entry.rdns,
             records,
         },
     ))
@@ -1452,6 +1460,7 @@ mod tests {
             priority: 100,
             version,
             ttl: 60,
+            rdns: true,
             records: vec![RrData {
                 rtype: RecordType::A,
                 data: RecordData::A(ip.parse().unwrap()),
@@ -1480,7 +1489,8 @@ mod tests {
     fn wire_roundtrip() {
         let zone = Name::from_str("namae.").unwrap();
         let name = Name::from_str("a.namae.").unwrap();
-        let entry = entry(7, 3, "10.0.0.1");
+        let mut entry = entry(7, 3, "10.0.0.1");
+        entry.rdns = false;
         let wire = wire_entry(&name, &entry, &zone);
         let (decoded_name, decoded) = entry_from_wire(&zone, 7, &wire).unwrap();
         assert_eq!(decoded_name, name);
@@ -1501,6 +1511,7 @@ mod tests {
                     ttl: Some(60),
                     priority: 100,
                     publish: true,
+                    rdns: true,
                 }],
                 &HashMap::new(),
                 60,
@@ -1576,6 +1587,7 @@ mod integration_tests {
                     ttl: Some(60),
                     priority: 100,
                     publish: true,
+                    rdns: true,
                 }],
                 &HashMap::new(),
                 60,
@@ -1706,6 +1718,7 @@ mod partial_mesh_tests {
                     ttl: Some(60),
                     priority: 100,
                     publish: true,
+                    rdns: true,
                 }],
                 &HashMap::new(),
                 60,

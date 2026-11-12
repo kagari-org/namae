@@ -60,6 +60,7 @@ magic "NM" | v u8 | kind u8 | seq u64 | len u32 | body | mac[32]
       "priority": 100,
       "version": 3,
       "ttl": 300,
+      "rdns": true,
       "records": [
         { "rtype": "A", "value": "10.0.0.1" }
       ]
@@ -149,6 +150,7 @@ NameEntry {
   priority: u16,
   version: u64,
   ttl: u32,
+  rdns: bool,
   records: [(RecordType, RData)],
 }
 ```

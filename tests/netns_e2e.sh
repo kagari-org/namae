@@ -84,7 +84,6 @@ write_config() {
     mkdir -p "$path.d"
     cat > "$path" <<CONFIG
 zone = "namae."
-reverse_zones = ["10.in-addr.arpa."]
 dns_listen = ["127.0.0.1:15353"]
 port = 17654
 secret = "netns-e2e"

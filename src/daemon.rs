@@ -51,7 +51,6 @@ pub async fn run(config_path: PathBuf, config_dir: PathBuf, ctl_path: PathBuf) -
 
     let dns = Arc::new(DnsService::new(
         loaded.zone.clone(),
-        loaded.reverse_zones.clone(),
         &*store.read().await,
         loaded.raw.negative_ttl,
     )?);
@@ -186,9 +185,6 @@ async fn reload(
         && id != old.node_id()
     {
         bail!("changing id requires a restart");
-    }
-    if new.reverse_zones != old.reverse_zones {
-        warn!("changing reverse_zones requires a restart");
     }
     let secret_changed = new.secret != old.secret;
     let new_secret = new.secret.clone();
